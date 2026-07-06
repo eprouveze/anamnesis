@@ -27,8 +27,6 @@ Most "agent memory" designs quietly depend on one machine or one hosted database
 When that primary dies, writing and refreshing memory stops. The trick here: **if your
 sources already live in git, the database is a *derived* artifact** — rebuild it anywhere
 from the sources plus an embeddings cache, and the "primary machine" concept disappears.
-The full narrative — a real outage, a multi-model design review, a security pass, and the
-rebuild — is in [docs/the-story.md](docs/the-story.md).
 
 ## Quickstart
 
@@ -56,7 +54,7 @@ Point your replicas at it with `tools/pull-and-serve.sh`.
 | `.github/workflows/index.yml` | the pipeline — index + publish on push + nightly |
 | `.github/workflows/smoke.yml` | prove your key works in CI (one embedding call) |
 | `data/` | your memory (markdown), decisions, and structured manifests — the example corpus ships so it builds out of the box |
-| `docs/` | [architecture](docs/architecture.md) · [the story](docs/the-story.md) · [operations](docs/operations.md) |
+| `docs/` | [architecture](docs/architecture.md) · [operations](docs/operations.md) |
 
 ## Design in one diagram
 

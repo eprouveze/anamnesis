@@ -40,7 +40,7 @@ WEIGHTS = {"decision": 1.5, "feedback": 1.2, "memory": 1.0, "reference": 1.0,
 
 def now_utc() -> str:
     # Always UTC + Z. Never naive-local — mixing conventions in one column silently
-    # breaks freshness comparisons (a lesson learned the hard way; see docs/the-story.md).
+    # breaks any MAX()/freshness comparison across the timezone offset.
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
