@@ -1,0 +1,7 @@
+.embcache/
+memory.db
+manifest.json
+*.pyc
+__pycache__/
+.venv/
+.env

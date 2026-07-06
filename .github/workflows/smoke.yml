@@ -1,0 +1,19 @@
+name: smoke
+# Prove GEMINI_API_KEY works in CI with one real embedding call (dim check).
+on: { workflow_dispatch: {} }
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install --quiet google-genai
+      - env: { GEMINI_API_KEY: '${{ secrets.GEMINI_API_KEY }}' }
+        run: |
+          python - <<'PY'
+          import os
+          from google import genai
+          r = genai.Client(api_key=os.environ["GEMINI_API_KEY"]).models.embed_content(
+              model="gemini-embedding-001", contents=["anamnesis smoke"])
+          d = len(r.embeddings[0].values); print("dim", d); assert d == 3072; print("SMOKE PASS")
+          PY
