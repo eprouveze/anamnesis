@@ -1,13 +1,15 @@
 name: index
-# Index data/ → embed → publish memory.db as a Release artifact.
+# Index data/ → embed → sign with Cosign (Keyless OIDC) → publish memory.db as a Release artifact.
 # concurrency:1 serializes the writer; git commit ordering means no split-brain.
 on:
   push:
-    paths: ['data/**', 'tools/**']
+    paths: ['data/**', 'tools/**', '.github/workflows/index.yml']
   schedule: [{ cron: '0 4 * * *' }]
   workflow_dispatch: {}
 concurrency: { group: index, cancel-in-progress: false }
-permissions: { contents: write }
+permissions:
+  contents: write
+  id-token: write # Required for keyless Sigstore/Cosign OIDC signing
 jobs:
   index:
     runs-on: ubuntu-latest
@@ -16,28 +18,44 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
       - run: pip install --quiet google-genai
+      - uses: sigstore/cosign-installer@v3.8.1
+
       - name: Build memory.db
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ANAMNESIS_DATA_ROOT: ${{ github.workspace }}/data
           ANAMNESIS_OUT: ${{ github.workspace }}/memory.db
         run: python tools/index.py
-      - name: Integrity floor
+
+      - name: Integrity floor & Manifest
         run: |
           python - <<'PY'
-          import sqlite3, os, json
+          import sqlite3, os, json, hashlib
+          db_bytes = open("memory.db", "rb").read()
+          sha = hashlib.sha256(db_bytes).hexdigest()
           n = sqlite3.connect("memory.db").execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
           e = sqlite3.connect("memory.db").execute("SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL").fetchone()[0]
-          size = os.path.getsize("memory.db")
-          print(f"chunks={n} embedded={e} size={size}")
+          size = len(db_bytes)
+          print(f"chunks={n} embedded={e} size={size} sha256={sha[:12]}...")
           assert n >= 1 and e == n and size > 20_000, "integrity floor failed"
-          json.dump({"chunks": n, "embedded": e, "size_bytes": size,
-                     "source_commit": os.environ.get("GITHUB_SHA","")}, open("manifest.json","w"), indent=2)
+          manifest = {
+              "chunks": n,
+              "embedded": e,
+              "size_bytes": size,
+              "sha256": sha,
+              "source_commit": os.environ.get("GITHUB_SHA", "")
+          }
+          json.dump(manifest, open("manifest.json", "w"), indent=2)
           print("INTEGRITY OK")
           PY
+
+      - name: Sign artifact (Keyless OIDC)
+        run: |
+          cosign sign-blob --yes --bundle cosign.bundle memory.db
+
       - name: Publish Release
         env: { GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
         run: |
-          gh release create "build-${{ github.run_number }}" memory.db manifest.json \
+          gh release create "build-${{ github.run_number }}" memory.db manifest.json cosign.bundle \
             --repo "${{ github.repository }}" --latest --title "build-${{ github.run_number }}" \
-            --notes "Auto-indexed memory.db from data/ (example corpus)."
+            --notes "Auto-indexed, cryptographically signed memory.db from data/."

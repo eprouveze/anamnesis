@@ -12,10 +12,11 @@ durable, resilient, and yours. This is the genericized core of one such system.
 > **The DB is a build artifact. Git is the write-ahead log. The writer is a pipeline.**
 
 Memory entries are **git commits** (markdown/JSON under `data/`). A **GitHub Actions
-pipeline** indexes and embeds them into a `memory.db` (SQLite FTS5 + vector rerank) and
+pipeline** indexes and embeds them into a `memory.db` (SQLite FTS5 + vector rerank),
+cryptographically signs the build artifact with **keyless Sigstore/Cosign**, and
 publishes it as a **Release artifact**. Every machine is a disposable replica that pulls
-the artifact and serves it. Lose any machine — or all of them — and the write path still
-works (git commits queue offline) and the index rebuilds anywhere.
+the artifact, verifies its provenance signature, and serves it. Lose any machine — or all of
+them — and the write path still works (git commits queue offline) and the index rebuilds anywhere.
 
 > These are working tools with rough edges, not a polished product. The author runs a
 > heavily-extended, private instance of this daily; this repo is the genericized core you
@@ -40,7 +41,7 @@ python tools/recall.py "how should I store timestamps?"
 ```
 
 To run it as a pipeline: add `GEMINI_API_KEY` as an Actions secret, commit a memory under
-`data/memory/`, and push — the `index` workflow builds and publishes a `memory.db` Release.
+`data/memory/`, and push — the `index` workflow builds, signs, and publishes a `memory.db` Release.
 Point your replicas at it with `tools/pull-and-serve.sh`.
 
 ## What's here
@@ -49,9 +50,9 @@ Point your replicas at it with `tools/pull-and-serve.sh`.
 |---|---|
 | `tools/index.py` | the indexer — `data/` → embed → `memory.db` (env-driven, runs anywhere) |
 | `tools/recall.py` | reference reader — FTS5 candidates → embedding rerank |
-| `tools/pull-and-serve.sh` | replica: pull latest Release → verify → atomic swap |
+| `tools/pull-and-serve.sh` | replica: pull latest Release → verify (Cosign OIDC + SHA256) → atomic swap |
 | `tools/anamnesis-rebuild.sh` | local twin of the pipeline (recovery when CI is down) |
-| `.github/workflows/index.yml` | the pipeline — index + publish on push + nightly |
+| `.github/workflows/index.yml` | the pipeline — index + sign with Cosign + publish on push + nightly |
 | `.github/workflows/smoke.yml` | prove your key works in CI (one embedding call) |
 | `data/` | your memory (markdown), decisions, and structured manifests — the example corpus ships so it builds out of the box |
 | `docs/` | [architecture](docs/architecture.md) · [operations](docs/operations.md) |
@@ -59,10 +60,20 @@ Point your replicas at it with `tools/pull-and-serve.sh`.
 ## Design in one diagram
 
 ```
-WRITE (any device, offline-ok)    BUILD (no machine required)        SERVE (disposable replicas)
-  memory = git commit to data/ ─►  GitHub Actions (concurrency:1) ─►  pull latest Release →
-  (phone, laptop, agent, CI)       index + embed → memory.db         verify → atomic swap → serve
+WRITE (any device, offline-ok)    BUILD & SIGN (no machine required)      SERVE (disposable replicas)
+  memory = git commit to data/ ─►  GitHub Actions (concurrency:1) ──────►  pull latest Release →
+  (phone, laptop, agent, CI)       index + embed + Cosign sign → memory.db  verify signature → atomic swap
 ```
+
+## Security: Preventing Belief Breaches
+
+When your memory database is a downloadable file, an attacker who compromises a write token
+could publish a poisoned memory artifact with a matching checksum. The agent would read it,
+trust it, and act on it.
+
+To prevent this, every release artifact is cryptographically signed using **keyless Sigstore/Cosign**
+during the GitHub Actions run. Replicas run `tools/pull-and-serve.sh` to verify that the artifact
+was built by *this exact repository workflow on `main`* before swapping it into service.
 
 ## Serving to an agent
 

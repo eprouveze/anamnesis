@@ -20,7 +20,8 @@ ordering serializes writers, so **split-brain is structurally impossible**: ther
 On push to `data/**` (and nightly), a GitHub Actions job runs `tools/index.py`:
 checkout → embed each chunk (`gemini-embedding-001`, dim 3072) → write `memory.db`
 (SQLite FTS5 keyword index + `embedding BLOB`) → **integrity floor** (non-empty,
-fully embedded, min size) → publish `memory.db` + `manifest.json` as a **Release asset**.
+fully embedded, min size) → **keyless Sigstore/Cosign signing** (`cosign sign-blob`) →
+publish `memory.db` + `manifest.json` + `cosign.bundle` as a **Release asset**.
 `concurrency: index` serializes runs.
 
 The indexer takes **no machine-specific paths** — it is driven by `ANAMNESIS_DATA_ROOT`,
@@ -31,7 +32,8 @@ the CI itself is the broken thing.
 ## 3. Serve = disposable replicas
 
 Each serving machine runs `tools/pull-and-serve.sh` on a timer: fetch the latest Release →
-**verify** (sanity floor; add signature verification in production) → download-to-temp →
+**verify provenance** (Sigstore/Cosign certificate identity pinned to the repo's main workflow) →
+**verify checksum** (SHA-256 against manifest) → **integrity floor** (min size, chunk count) →
 **atomic `mv`** into place. N replicas, none individually required. In production you front
 them with a small failover proxy so a reader always hits a live one.
 
@@ -58,7 +60,7 @@ Controls, in rough priority:
 | Control | Why |
 |---|---|
 | **Protect the pipeline** — CODEOWNERS/branch-protection on `.github/**` + `tools/**`; data commits touch only `data/**` | The workflow holds the embedding key; a data-write credential must not be able to edit it. |
-| **Verify artifacts before serving** — signature + sanity floor before the atomic swap | A poisoned release would otherwise become trusted context fleet-wide. Prefer a signature whose key never touches the CI runner (e.g. cosign / sigstore). |
+| **Verify artifacts before serving** — keyless Sigstore/Cosign signature + SHA-256 checksum + sanity floor before atomic swap | A poisoned release would otherwise become trusted context fleet-wide. Keyless OIDC binds signatures to the repository workflow on `main` without long-lived keys on runners. |
 | **Quarantine high-trust writes** — decisions land on a review branch, merge after a window | A single injected "decision" must not silently become authoritative for every future session. |
 | **Attributable writes** — carry the writer's identity in each commit | So a bad entry is traceable to who/what wrote it. |
 | **Split credentials** — replicas pull with a read-only, releases-scoped token; writers use a separate write token | A compromised read-only replica must not gain write access. |
