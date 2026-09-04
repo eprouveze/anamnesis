@@ -3,6 +3,7 @@ name: index
 # concurrency:1 serializes the writer; git commit ordering means no split-brain.
 on:
   push:
+    branches: [main]  # a branch push must never publish a --latest Release (dispatch: see the if: below)
     paths: ['data/**', 'tools/**', '.github/workflows/index.yml']
   schedule: [{ cron: '0 4 * * *' }]
   workflow_dispatch: {}
@@ -54,6 +55,7 @@ jobs:
           cosign sign-blob --yes --bundle cosign.bundle memory.db
 
       - name: Publish Release
+        if: github.ref == 'refs/heads/main'  # workflow_dispatch from a branch builds but never publishes
         env: { GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
         run: |
           gh release create "build-${{ github.run_number }}" memory.db manifest.json cosign.bundle \

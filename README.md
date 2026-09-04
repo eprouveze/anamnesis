@@ -49,11 +49,13 @@ Point your replicas at it with `tools/pull-and-serve.sh`.
 | Path | Role |
 |---|---|
 | `tools/index.py` | the indexer — `data/` → embed → `memory.db` (env-driven, runs anywhere) |
-| `tools/recall.py` | reference reader — FTS5 candidates → embedding rerank |
+| `tools/recall.py` | reference reader — FTS5 candidates → embedding rerank; query embeddings cached, keyword-only fallback when the API is unavailable |
+| `tools/test_recall.py` | unit tests for the cache and fallback — stdlib only, no API key |
 | `tools/pull-and-serve.sh` | replica: pull latest Release → verify (Cosign OIDC + SHA256) → atomic swap |
 | `tools/anamnesis-rebuild.sh` | local twin of the pipeline (recovery when CI is down) |
 | `.github/workflows/index.yml` | the pipeline — index + sign with Cosign + publish on push + nightly |
 | `.github/workflows/smoke.yml` | prove your key works in CI (one embedding call) |
+| `.github/workflows/test.yml` | unit tests on every PR — no secrets needed |
 | `data/` | your memory (markdown), decisions, and structured manifests — the example corpus ships so it builds out of the box |
 | `docs/` | [architecture](docs/architecture.md) · [operations](docs/operations.md) |
 
