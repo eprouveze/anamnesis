@@ -27,11 +27,10 @@ from pathlib import Path
 
 DB = Path(os.environ.get("ANAMNESIS_OUT", "memory.db"))
 MODEL = os.environ.get("ANAMNESIS_EMBEDDING_MODEL", "gemini-embedding-001")
-QUERY_CACHE = Path(os.environ.get("ANAMNESIS_QUERY_CACHE", str(DB.with_suffix(".queries.db"))))
+QUERY_CACHE = Path(os.environ.get("ANAMNESIS_QUERY_CACHE", str(DB) + ".queries.db"))
 
-_MEM: dict[str, list[float]] = {}   # in-process cache; bounded so a long-lived caller can't grow unbounded
+_MEM: dict[str, list[float]] = {}   # in-process cache; flushed wholesale at _MEM_MAX (capped, not LRU)
 _MEM_MAX = 512
-_SCHEMA_OK: set[str] = set()        # cache paths whose schema was ensured in this process
 
 
 def pack(values: list[float]) -> bytes:
@@ -53,25 +52,23 @@ def cosine(a: list[float], b: list[float]) -> float:
 
 def cache_key(text: str) -> str:
     # Whitespace-only normalisation. Case and accents change the embedding, so they must
-    # change the key — lowercasing would serve one casing's vector for the other.
+    # change the key — lowercasing would serve one casing's vector for the other. The model
+    # is part of the key, so rows from a previous model are simply never served.
     norm = " ".join(text.split())
-    return hashlib.sha1(f"{MODEL}\n{norm}".encode("utf-8")).hexdigest()
+    return hashlib.sha256(f"{MODEL}\n{norm}".encode("utf-8")).hexdigest()
 
 
 def _cache_conn() -> sqlite3.Connection:
     # Shared by any long-running caller AND short-lived CLI invocations: WAL so readers and
     # the writer never block each other; a short busy timeout because this sits on the
     # interactive path — a locked file means "miss", not "wait".
+    # Schema setup is idempotent and cheap, so it runs on every connect rather than being
+    # memoised per path — a memo goes stale if the file is deleted or QUERY_CACHE is reassigned.
     conn = sqlite3.connect(str(QUERY_CACHE), timeout=0.5)
-    path_key = str(QUERY_CACHE)
-    if path_key not in _SCHEMA_OK:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("""CREATE TABLE IF NOT EXISTS query_embeddings (
-            key TEXT PRIMARY KEY, model TEXT NOT NULL, dim INTEGER NOT NULL,
-            embedding BLOB NOT NULL, created_at TEXT NOT NULL)""")
-        conn.execute("DELETE FROM query_embeddings WHERE model != ?", (MODEL,))  # reap stale-model rows
-        conn.commit()
-        _SCHEMA_OK.add(path_key)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""CREATE TABLE IF NOT EXISTS query_embeddings (
+        key TEXT PRIMARY KEY, model TEXT NOT NULL, dim INTEGER NOT NULL,
+        embedding BLOB NOT NULL, created_at TEXT NOT NULL)""")
     return conn
 
 
@@ -82,9 +79,9 @@ def _cache_get(key: str) -> list[float] | None:
                                (key, MODEL)).fetchone()
         if not row:
             return None
-        emb = unpack(row[0])
+        emb = unpack(row[0])  # a torn blob raises struct.error → caught below → miss
         if not emb or len(emb) != row[1]:
-            return None  # torn/corrupt blob or dimension mismatch → miss
+            return None  # dimension mismatch → miss
         return emb
     except Exception as e:
         # The cache is an accelerator, never a dependency — but a silent miss hides
@@ -100,7 +97,7 @@ def _cache_put(key: str, emb: list[float]) -> None:
             conn.execute("INSERT OR IGNORE INTO query_embeddings (key, model, dim, embedding, created_at)"
                          " VALUES (?, ?, ?, ?, ?)",
                          (key, MODEL, len(emb), pack(emb),
-                          datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")))
+                          datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")))
             conn.commit()
     except Exception as e:
         print(f"query-cache write failed ({type(e).__name__}: {str(e)[:120]}) — vector not cached",
@@ -110,10 +107,10 @@ def _cache_put(key: str, emb: list[float]) -> None:
 def _embed_remote(q: str) -> list[float]:
     """ONE API call, no retry: a 429 raises immediately so the caller can degrade in
     milliseconds instead of sleeping through a quota window."""
-    from google import genai
     key = os.environ.get("GEMINI_API_KEY")
-    if not key:
-        sys.exit("GEMINI_API_KEY not set (https://aistudio.google.com/apikey)")
+    if not key:  # raise, don't exit: recall() degrades to keyword-only on an offline replica
+        raise RuntimeError("GEMINI_API_KEY not set (https://aistudio.google.com/apikey)")
+    from google import genai  # after the key check: a replica without the SDK still degrades cleanly
     client = genai.Client(api_key=key)  # bind — a temporary Client gets GC'd and closes its httpx client mid-call
     r = client.models.embed_content(model=MODEL, contents=[q])
     return list(r.embeddings[0].values)
@@ -155,10 +152,8 @@ def recall(query: str, k: int = 5, candidates: int = 50) -> list[dict]:
         ).fetchall()
     try:
         qv = embed_query(query)
-    except SystemExit:
-        raise
     except Exception as e:
-        # Quota exhausted / network down: keyword-only results beat no results. Without a
+        # No key / quota exhausted / network down: keyword-only results beat none. Without a
         # keyword hit there is nothing sensible to rank, so surface the error instead.
         if not fts_hit:
             raise
@@ -179,5 +174,10 @@ def recall(query: str, k: int = 5, candidates: int = 50) -> list[dict]:
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         sys.exit('Usage: python tools/recall.py "your question"')
-    for r in recall(" ".join(sys.argv[1:])):
-        print(f"[{r['score']}] ({r['store_type']}) {r['title']}\n    {r['content'][:160].strip()}\n")
+    try:
+        results = recall(" ".join(sys.argv[1:]))
+    except RuntimeError as e:
+        sys.exit(str(e))
+    for r in results:
+        score = "kw" if r["score"] is None else r["score"]  # "kw" = keyword-only fallback, unranked
+        print(f"[{score}] ({r['store_type']}) {r['title']}\n    {r['content'][:160].strip()}\n")

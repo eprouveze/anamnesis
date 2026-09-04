@@ -15,11 +15,12 @@ GEMINI_API_KEY=... python tools/index.py       # → memory.db
 GEMINI_API_KEY=... python tools/recall.py "your question"
 ```
 
-Query embeddings are cached in `memory.queries.db` next to `memory.db` (override with
-`ANAMNESIS_QUERY_CACHE`); a repeated question costs no API call. The cache is keyed by
-model, so changing `ANAMNESIS_EMBEDDING_MODEL` discards the old rows on first use. If the
-embedding call fails (quota, network), recall prints a warning to stderr and returns the
-keyword matches unranked (`score: null`) rather than failing. Delete the file to reset.
+Query embeddings are cached in `memory.db.queries.db` next to `memory.db` (override with
+`ANAMNESIS_QUERY_CACHE`); a repeated question costs no API call. Rows are keyed by model,
+so changing `ANAMNESIS_EMBEDDING_MODEL` never serves a stale vector; old rows are tiny and
+are left in place. If the embedding call fails (no key, quota, network), recall prints a
+warning to stderr and returns the keyword matches unranked (`score: null`, shown as `[kw]`
+by the CLI) rather than failing. Delete the file to reset.
 
 ## Test
 
