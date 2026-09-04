@@ -5,6 +5,8 @@ on:
   push:
     branches: [main]  # a branch push must never publish a --latest Release (dispatch: see the if: below)
     paths: ['data/**', 'tools/**', '.github/workflows/index.yml']
+  pull_request:
+    paths: ['data/**', 'tools/**', '.github/workflows/index.yml']
   schedule: [{ cron: '0 4 * * *' }]
   workflow_dispatch: {}
 concurrency: { group: index, cancel-in-progress: false }
@@ -51,6 +53,7 @@ jobs:
           PY
 
       - name: Sign artifact (Keyless OIDC)
+        if: github.ref == 'refs/heads/main'
         run: |
           cosign sign-blob --yes --bundle cosign.bundle memory.db
 

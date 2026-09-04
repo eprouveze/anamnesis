@@ -113,11 +113,33 @@ def to_chunks(src: dict) -> list[dict]:
             for c in chunk_text(body)]
 
 
+def mock_embedding(text: str, dim: int = EMBEDDING_DIM) -> list[float]:
+    """Deterministic normalized vector derived from text hash for CI/offline use without API keys."""
+    import hashlib
+    import math
+    h = hashlib.sha256(text.encode("utf-8")).digest()
+    seed = int.from_bytes(h[:8], "big")
+    vec: list[float] = []
+    val = seed
+    norm_sq = 0.0
+    for _ in range(dim):
+        val = (val * 6364136223846793005 + 1442695040888963407) & 0xFFFFFFFFFFFFFFFF
+        f = (val / 0xFFFFFFFFFFFFFFFF) * 2.0 - 1.0
+        vec.append(f)
+        norm_sq += f * f
+    inv = 1.0 / math.sqrt(norm_sq) if norm_sq > 0 else 1.0
+    return [x * inv for x in vec]
+
+
 def embed_all(texts: list[str]) -> list[list[float]]:
-    from google import genai
     key = os.environ.get("GEMINI_API_KEY")
-    if not key:
-        sys.exit("GEMINI_API_KEY not set (get one at https://aistudio.google.com/apikey)")
+    mock_mode = os.environ.get("ANAMNESIS_MOCK_EMBEDDINGS", "").lower() in ("1", "true", "yes")
+    if not key or key in ("mock", "dummy", "placeholder") or mock_mode:
+        print("  GEMINI_API_KEY not set (or mock mode enabled) — using deterministic mock embeddings (offline/CI mode)",
+              file=sys.stderr, flush=True)
+        return [mock_embedding(t, EMBEDDING_DIM) for t in texts]
+
+    from google import genai
     client = genai.Client(api_key=key)
     vecs: list[list[float]] = []
     for i in range(0, len(texts), BATCH):
@@ -126,6 +148,7 @@ def embed_all(texts: list[str]) -> list[list[float]]:
         vecs.extend(list(e.values) for e in r.embeddings)
         print(f"  embedded {min(i + BATCH, len(texts))}/{len(texts)}", flush=True)
     return vecs
+
 
 
 def init_db(path: Path) -> sqlite3.Connection:

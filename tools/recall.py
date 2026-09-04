@@ -104,10 +104,30 @@ def _cache_put(key: str, emb: list[float]) -> None:
               file=sys.stderr, flush=True)
 
 
+def mock_embedding(text: str, dim: int = 3072) -> list[float]:
+    """Deterministic unit vector derived from text hash for CI/offline use without API keys."""
+    h = hashlib.sha256(text.encode("utf-8")).digest()
+    seed = int.from_bytes(h[:8], "big")
+    vec: list[float] = []
+    val = seed
+    norm_sq = 0.0
+    for _ in range(dim):
+        val = (val * 6364136223846793005 + 1442695040888963407) & 0xFFFFFFFFFFFFFFFF
+        f = (val / 0xFFFFFFFFFFFFFFFF) * 2.0 - 1.0
+        vec.append(f)
+        norm_sq += f * f
+    inv = 1.0 / math.sqrt(norm_sq) if norm_sq > 0 else 1.0
+    return [x * inv for x in vec]
+
+
 def _embed_remote(q: str) -> list[float]:
     """ONE API call, no retry: a 429 raises immediately so the caller can degrade in
     milliseconds instead of sleeping through a quota window."""
     key = os.environ.get("GEMINI_API_KEY")
+    mock_mode = os.environ.get("ANAMNESIS_MOCK_EMBEDDINGS", "").lower() in ("1", "true", "yes")
+    if mock_mode or key in ("mock", "dummy", "placeholder"):
+        dim = int(os.environ.get("ANAMNESIS_EMBEDDING_DIM", "3072"))
+        return mock_embedding(q, dim)
     if not key:  # raise, don't exit: recall() degrades to keyword-only on an offline replica
         raise RuntimeError("GEMINI_API_KEY not set (https://aistudio.google.com/apikey)")
     from google import genai  # after the key check: a replica without the SDK still degrades cleanly
@@ -137,19 +157,19 @@ def embed_query(q: str) -> list[float]:
 def recall(query: str, k: int = 5, candidates: int = 50) -> list[dict]:
     if not DB.exists():
         sys.exit(f"{DB} not found — run tools/index.py first.")
-    conn = sqlite3.connect(str(DB))
-    fts_q = " OR ".join(re.findall(r"\w+", query)) or query
-    rows = conn.execute(
-        "SELECT c.chunk_id, c.title, c.content, c.store_type, c.weight, c.embedding "
-        "FROM chunks_fts f JOIN chunks c ON c.id = f.rowid "
-        "WHERE chunks_fts MATCH ? ORDER BY bm25(chunks_fts) LIMIT ?",
-        (fts_q, candidates),
-    ).fetchall()
-    fts_hit = bool(rows)
-    if not rows:  # fall back to whole corpus if keywords miss
+    with contextlib.closing(sqlite3.connect(str(DB))) as conn:
+        fts_q = " OR ".join(re.findall(r"\w+", query)) or query
         rows = conn.execute(
-            "SELECT chunk_id, title, content, store_type, weight, embedding FROM chunks"
+            "SELECT c.chunk_id, c.title, c.content, c.store_type, c.weight, c.embedding "
+            "FROM chunks_fts f JOIN chunks c ON c.id = f.rowid "
+            "WHERE chunks_fts MATCH ? ORDER BY bm25(chunks_fts) LIMIT ?",
+            (fts_q, candidates),
         ).fetchall()
+        fts_hit = bool(rows)
+        if not rows:  # fall back to whole corpus if keywords miss
+            rows = conn.execute(
+                "SELECT chunk_id, title, content, store_type, weight, embedding FROM chunks"
+            ).fetchall()
     try:
         qv = embed_query(query)
     except Exception as e:
