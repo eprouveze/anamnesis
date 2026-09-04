@@ -176,8 +176,8 @@ if __name__ == "__main__":
         sys.exit('Usage: python tools/recall.py "your question"')
     try:
         results = recall(" ".join(sys.argv[1:]))
-    except RuntimeError as e:
-        sys.exit(str(e))
+    except Exception as e:  # SDK errors are plain Exceptions, not RuntimeError
+        sys.exit(f"recall failed: {e}")
     for r in results:
         score = "kw" if r["score"] is None else r["score"]  # "kw" = keyword-only fallback, unranked
         print(f"[{score}] ({r['store_type']}) {r['title']}\n    {r['content'][:160].strip()}\n")
