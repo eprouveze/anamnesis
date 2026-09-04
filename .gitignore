@@ -1,5 +1,6 @@
 .embcache/
 memory.db
+*.queries.db*
 manifest.json
 *.pyc
 __pycache__/

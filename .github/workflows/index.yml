@@ -3,6 +3,7 @@ name: index
 # concurrency:1 serializes the writer; git commit ordering means no split-brain.
 on:
   push:
+    branches: [main]  # a branch push must never publish a --latest Release
     paths: ['data/**', 'tools/**', '.github/workflows/index.yml']
   schedule: [{ cron: '0 4 * * *' }]
   workflow_dispatch: {}
