@@ -77,13 +77,43 @@ To prevent this, every release artifact is cryptographically signed using **keyl
 during the GitHub Actions run. Replicas run `tools/pull-and-serve.sh` to verify that the artifact
 was built by *this exact repository workflow on `main`* before swapping it into service.
 
-## Serving to an agent
+## Serving to an Agent via MCP (Claude Code, Codex, Cursor)
 
-`recall.py` is a reference reader. In production you serve `memory.db` over the
-[Model Context Protocol](https://modelcontextprotocol.io) so an agent can call `recall`
-directly — see [docs/architecture.md](docs/architecture.md#serving). The MCP server is
-intentionally out of this core kit (it's the easy part); the hard part is the durable,
-no-primary write/refresh path, which is what this repo is about.
+Anamnesis includes a native **Model Context Protocol (MCP)** server in `tools/mcp_server.py`.
+
+### 1. Add to Claude Code
+```bash
+claude mcp add anamnesis -e GEMINI_API_KEY=your_key -- python /path/to/anamnesis/tools/mcp_server.py
+```
+Or via `uv` (zero virtualenv setup required):
+```bash
+claude mcp add anamnesis -e GEMINI_API_KEY=your_key -- uv run --with mcp --with google-genai /path/to/anamnesis/tools/mcp_server.py
+```
+
+### 2. Add to Cursor / Windsurf / Codex
+Add to your `mcp.json` or `.cursor/mcp.json`:
+```json
+{
+  "mcpServers": {
+    "anamnesis": {
+      "command": "python",
+      "args": ["/absolute/path/to/anamnesis/tools/mcp_server.py"],
+      "env": {
+        "GEMINI_API_KEY": "your_gemini_api_key",
+        "ANAMNESIS_OUT": "/path/to/anamnesis/memory.db"
+      }
+    }
+  }
+}
+```
+
+Exposed MCP tools:
+- `recall_memory(query, limit, store_types)`: Semantic search with cosine reranking and offline keyword fallback.
+- `store_memory(type, title, content, rationale)`: Stores a markdown memory chunk and indexes it.
+- `store_decision(title, context, decision, alternatives, rationale)`: Appends an authoritative architectural decision.
+- `get_recent(limit, store_types)`: Chronological memory retrieval.
+- `get_decisions(limit, query)`: Filtered decision search.
+- `health()`: Verifies database size, chunk counts, and build commit.
 
 ## License
 
