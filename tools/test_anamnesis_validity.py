@@ -152,7 +152,7 @@ class TestGateAndCli(ValidityCase):
     def shadow(self, days, false=0, cov=0.72):
         started = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
         validity.write_shadow({"started_at": started, "verdicts": [], "false_supersessions": false,
-                         "key_coverage": cov})
+                         "key_coverage": cov, "db": str(self.db.resolve())})
 
     def test_gate_decision_reasons(self):
         self.assertFalse(validity.gate_decision({})["pass"])
@@ -215,6 +215,17 @@ class TestGateAndCli(ValidityCase):
         self.assertFalse(validity.is_validity_live())
         conn = sqlite3.connect(str(self.db))
         self.assertTrue(conn.execute("SELECT valid_to FROM nugget_links WHERE id=1").fetchone()[0])
+
+    def test_apply_refuses_a_database_the_shadow_run_did_not_measure(self):
+        self.make_db()
+        self.shadow(31)
+        other = self.db.with_name("other.db")
+        self.make_db(path=other).close()
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = validity.main(["--db", str(other), "apply"])
+        self.assertEqual(rc, 2)
+        self.assertIn("shadow run measured", err.getvalue())
 
 
 if __name__ == "__main__":

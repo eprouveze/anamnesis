@@ -24,10 +24,11 @@ directly over MCP. Either way the database is rebuildable from git.
 
 ```bash
 git clone https://github.com/eprouveze/anamnesis && cd anamnesis
-python -m venv .venv && . .venv/bin/activate
+python3.12 -m venv .venv && . .venv/bin/activate   # Python 3.12+
 pip install -r requirements.txt
 
 export GEMINI_API_KEY=...                    # or ANAMNESIS_EMBED_BACKEND=mock / local
+# local backend only: pip install sentence-transformers torch
 python tools/index.py build                  # data/ → ~/.anamnesis/memory.db
 python tools/recall.py "how should I store timestamps?"
 ```
@@ -62,7 +63,9 @@ point `ANAMNESIS_SOURCES` at it.
 
 Local (stdio — trusted, no token):
 ```bash
-claude mcp add anamnesis -e GEMINI_API_KEY="$GEMINI_API_KEY" -- \
+# single quotes: the client stores the ${GEMINI_API_KEY} reference and expands it at launch,
+# so the key itself never lands in its config file
+claude mcp add anamnesis -e 'GEMINI_API_KEY=${GEMINI_API_KEY}' -- \
   /path/to/anamnesis/.venv/bin/python /path/to/anamnesis/tools/mcp_server.py --transport stdio
 ```
 

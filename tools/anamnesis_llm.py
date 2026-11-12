@@ -78,7 +78,7 @@ def _complete_command(prompt: str, timeout: float) -> str:
     try:
         r = subprocess.run(shlex.split(raw), input=prompt, capture_output=True, text=True,
                            timeout=timeout, env=_scrubbed_env())
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:  # ValueError: bad quoting / undecodable output
         raise LLMUnavailable(f"llm command failed: {exc.__class__.__name__}") from exc
     if r.returncode != 0 or not r.stdout.strip():
         raise LLMUnavailable(f"llm command exited {r.returncode} with {len(r.stdout)} bytes of output")

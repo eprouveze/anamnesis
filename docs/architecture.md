@@ -57,7 +57,8 @@ tools over stdio or HTTP. Two topologies work with the same code:
 `data/dictionary.json`) into rebuildable `ontology_nodes`, `ontology_claims` and
 `ontology_evidence` tables, each row carrying its provenance. Links between chunks use
 stable logical coordinates (`source path + heading slug`) rather than row ids, so a full
-re-index never orphans them. `ontology_impact` answers "what depends on / breaks if X";
+re-index rebinds them as long as the file path and heading are unchanged. Renaming either
+changes the key; `ontology_audit` then lists the link as unresolved until it is repaired. `ontology_impact` answers "what depends on / breaks if X";
 `ontology_audit` reports unresolved links, contradictions and unverified claims.
 
 ## Latency & consistency

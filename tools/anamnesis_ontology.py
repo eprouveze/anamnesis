@@ -541,7 +541,7 @@ def repair_nugget_links(conn: sqlite3.Connection, reevaluate_ambiguous: bool = T
         if key_counts[c_key] > 1:
             status = "ambiguous"
         else:
-            for alt_score, alt_idx in ranked[1:5]:
+            for alt_score, alt_idx in ranked[1:]:  # first candidate from another document
                 _, alt_sp, _, alt_key = docs[alt_idx]
                 if alt_sp == canon_sp:
                     continue  # same underlying document, not a cross-doc ambiguity
@@ -1418,6 +1418,7 @@ def compile_ontology(
     through `LAST_COMPILE_WARNINGS` / the `warnings` count, never silently dropped.
     """
     ensure_ontology_schema(conn)
+    backfill_chunk_coordinates(conn)  # evidence rows bind to chunk_key; fill any missing first
     root = repo_root or default_repo_root()
     home = home_dir or Path.home()
 

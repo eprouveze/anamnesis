@@ -263,8 +263,18 @@ def record_skip(state, reason):
     # it must not read as routine progress output.
     print(f"gate: skip #{streak} — {reason}", file=sys.stderr)
 
-    if streak >= SKIP_ALERT_AFTER and (streak - SKIP_ALERT_AFTER) % SKIP_REALERT_EVERY == 0:
-        last_run = state.get("last_run_at", "never")
+    last_run = state.get("last_run_at", "never")
+    backstop_overdue = True  # never ran: nothing for the backstop to wait on
+    try:
+        last_dt = datetime.fromisoformat(str(last_run))
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=TZ)
+        backstop_overdue = (now - last_dt) > timedelta(days=STARVATION_BACKSTOP_DAYS + 1)
+    except ValueError:
+        pass
+    # Time-floor skips are normal between runs; only alert once the backstop is overdue.
+    if (backstop_overdue and streak >= SKIP_ALERT_AFTER
+            and (streak - SKIP_ALERT_AFTER) % SKIP_REALERT_EVERY == 0):
         push_alert(
             "anamnesis dream: gate wedged shut",
             f"{streak} consecutive skips (last run: {last_run}). The "
@@ -875,6 +885,14 @@ def apply_approved_prunes(con, review_dir=None, db_file=None):
             proposal["prune_applied"] = {"at": now_iso, "status": "already_inactive"}
             _atomic_write_json(path, proposal)
             continue
+        keep_row = con.execute(
+            "SELECT retirement_status FROM chunks WHERE chunk_id=?", (canon_id,)).fetchone()
+        if not keep_row or keep_row[0] != "active":
+            # Never retire a chunk in favour of one that is gone or itself retired.
+            proposal["prune_applied"] = {
+                "at": now_iso, "status": "skipped_keep_missing" if not keep_row else "skipped_keep_inactive"}
+            _atomic_write_json(path, proposal)
+            continue
 
         new_tags = (old_tags + f" superseded_by:{canon_id} dream:{now_iso[:10]}").strip()
         con.execute(
@@ -895,12 +913,17 @@ def apply_approved_prunes(con, review_dir=None, db_file=None):
         })
         applied_ids.append(proposal.get("id", cid))
 
-    con.commit()
     summary = {
         "chunks_retired": len(journal),
         "proposals_processed": len(approved),
     }
-    journal_path = write_journal(journal, summary, []) if journal else None
+    # Undo journal first: a commit without a journal would be an irreversible retirement.
+    try:
+        journal_path = write_journal(journal, summary, []) if journal else None
+    except Exception:
+        con.rollback()
+        raise
+    con.commit()
 
     for path, proposal in approved:
         if proposal.get("id") in applied_ids:

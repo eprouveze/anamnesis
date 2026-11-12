@@ -504,14 +504,20 @@ def gate_decision(data: dict | None = None, now: datetime | None = None) -> dict
     }
 
 
-def record_shadow_run(conn: sqlite3.Connection) -> dict:
+def _db_identity(path: Path | None) -> str:
+    return str(Path(path or memory_db_path()).expanduser().resolve())
+
+
+def record_shadow_run(conn: sqlite3.Connection, db_path: Path | None = None) -> dict:
     """Compute verdicts (read-only) and persist them to the shadow file.
 
     The shadow window starts at the first recorded run and is preserved across
-    later runs; counters reflect the latest run.
+    later runs; counters reflect the latest run. The database the run measured is
+    recorded so `apply` cannot act on a different one.
     """
     result = compute_supersessions(conn)
     shadow = load_shadow()
+    shadow["db"] = _db_identity(db_path)
     shadow["started_at"] = shadow.get("started_at") or _now_iso()
     shadow["updated_at"] = _now_iso()
     shadow["verdicts"] = result["verdicts"]
@@ -531,7 +537,7 @@ def _open_db(path: Path | None = None) -> sqlite3.Connection:
 def _cmd_shadow(args) -> int:
     conn = _open_db(args.db)
     try:
-        shadow = record_shadow_run(conn)
+        shadow = record_shadow_run(conn, args.db)
     finally:
         conn.close()
     print(f"shadow: {len(shadow['verdicts'])} verdict(s), "
@@ -563,8 +569,23 @@ def _cmd_apply(args) -> int:
         print("apply refused (gate not satisfied; use --force to override):\n  - "
               + "\n  - ".join(verdict["reasons"]), file=sys.stderr)
         return 2
-    conn = _open_db(getattr(args, "db", None))
+    force = getattr(args, "force", False)
+    target = getattr(args, "db", None)
+    if not force:
+        recorded = load_shadow().get("db")
+        if recorded != _db_identity(target):
+            print(f"apply refused: the shadow run measured {recorded!r}, not "
+                  f"{_db_identity(target)!r} (re-run `shadow` against it, or --force)", file=sys.stderr)
+            return 2
+    conn = _open_db(target)
     try:
+        if not force:
+            min_cov = float(os.environ.get("ANAMNESIS_VALIDITY_MIN_COVERAGE", DEFAULT_MIN_COVERAGE))
+            live = compute_supersessions(conn)
+            if live["key_coverage"] is None or float(live["key_coverage"]) < min_cov:
+                print(f"apply refused: target key coverage {live['key_coverage']!r} below {min_cov}",
+                      file=sys.stderr)
+                return 2
         res = apply_supersessions(conn)
     finally:
         conn.close()

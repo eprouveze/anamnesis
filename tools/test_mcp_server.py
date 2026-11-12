@@ -58,6 +58,14 @@ def rpc(client: TestClient, tool: str, args: dict | None = None, headers: dict |
     return client.post("/mcp", json=body, headers={**MCP_HEADERS, **(headers or {})}, params=params)
 
 
+def tool_result(resp) -> dict:
+    """The JSON-RPC `result` of a tools/call response (plain JSON or a single SSE event)."""
+    text = resp.text
+    if not text.lstrip().startswith("{"):
+        text = next(l[5:] for l in text.splitlines() if l.startswith("data:"))
+    return json.loads(text)["result"]
+
+
 def bearer(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
@@ -249,8 +257,9 @@ class HttpAuthTests(Env):
         self.assertTrue((self.data / "memory" / "user_likes_tea.md").exists())
 
     def test_revoked_token_stops_working_without_restart(self):
-        m.revoke_client("writer")
         with TestClient(self.app) as c:
+            self.assertEqual(rpc(c, "health", headers=bearer(self.rw)).status_code, 200)
+            m.revoke_client("writer")
             self.assertEqual(rpc(c, "health", headers=bearer(self.rw)).status_code, 401)
 
     def test_unauthenticated_health_route_is_minimal(self):
@@ -479,7 +488,9 @@ class HardeningTests(Env):
         app = m.build_http_app(host_origin_protection=False)
         with TestClient(app) as c:
             self.assertIn("read-only", rpc(c, "zz_new_tool", headers=bearer(ro)).text)
-            self.assertIn("x", rpc(c, "zz_new_tool", headers=bearer(rw)).text)
+            res = tool_result(rpc(c, "zz_new_tool", headers=bearer(rw)))
+            self.assertFalse(res.get("isError"))
+            self.assertEqual(res["content"][0]["text"], "x")
 
     def test_errors_are_masked(self):
         self.assertTrue(m.mcp._mask_error_details)

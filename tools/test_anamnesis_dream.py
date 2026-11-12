@@ -398,6 +398,17 @@ class TestReviewQueue(DreamEnv):
         summary2, journal2, applied2 = ad.apply_approved_prunes(con, db_file=self.db)
         self.assertEqual((summary2["chunks_retired"], journal2, applied2), (0, None, []))
 
+    def test_prune_skipped_when_keep_target_is_missing(self):
+        con = make_db(self.db)
+        add(con, 2, "c_dupe", tags="t", ts="2026-09-19")
+        con.commit()
+        pid = ad.emit_prune_proposals([dict(CAND, chunk_id="c_dupe", canon_id="c_gone")])[0][0]
+        ad.set_proposal_status(pid, "approved")
+        summary, journal_path, _ = ad.apply_approved_prunes(con, db_file=self.db)
+        self.assertEqual((summary["chunks_retired"], journal_path), (0, None))
+        self.assertEqual(con.execute(
+            "SELECT retirement_status FROM chunks WHERE chunk_id='c_dupe'").fetchone()[0], "active")
+
     def test_undo_restores_status_and_tags(self):
         con = make_db(self.db)
         add(con, 1, "c_canon", tags="orig_tags", ts="2026-09-20")
@@ -412,7 +423,8 @@ class TestReviewQueue(DreamEnv):
         con = sqlite3.connect(str(self.db))
         row = con.execute("SELECT retirement_status, tags FROM chunks WHERE chunk_id='c_dupe'").fetchone()
         self.assertEqual(row, ("active", "orig_tags"))
-        self.assertEqual(ad.undo(str(self.tmp / "missing.jsonl")) if False else 0, 0)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(ad.undo(str(self.tmp / "missing.jsonl")), 2)
 
 
 class TestCli(DreamEnv):
