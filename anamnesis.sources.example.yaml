@@ -1,0 +1,98 @@
+# anamnesis sources config. Copy to anamnesis.sources.yaml and point the indexer at it:
+#
+#   export ANAMNESIS_SOURCES=/path/to/anamnesis.sources.yaml
+#   python tools/index.py sources     # show what would be indexed (no writes)
+#   python tools/index.py build
+#
+# With no ANAMNESIS_SOURCES the indexer uses the equivalent of the first three sources
+# below (data/memory, data/decisions, data/manifests). JSON works too (.json extension).
+#
+# Paths are filesystem paths only (URLs such as https:// or file: are rejected): absolute, or relative to THIS file. ~, $VAR and ${VAR} are expanded; an undefined
+# variable is an error. ${ANAMNESIS_DATA_DIR} and ${ANAMNESIS_HOME} always resolve.
+version: 1
+
+# Optional: extra / overridden weights per store_type (higher = more trusted at recall time).
+store_weights:
+  decision: 1.5
+  feedback: 1.2
+
+# Optional: query word -> project name, used to boost chunks of the project a query names.
+# Project names found in the index are matched automatically; add aliases only for nicknames.
+project_aliases: {}
+# Optional: projects that are cross-cutting (never penalised when another project is named).
+shared_projects: [shared]
+
+defaults:
+  project: default                  # project label for sources that do not set one
+  exclude:                          # applied to every `files` source (fnmatch on the relative path;
+    - node_modules                  # a bare name excludes any path component of that name)
+    - .git
+    - _archive
+
+sources:
+  # --- files: index markdown / json files under a root ---------------------------------
+  - name: memory
+    root: ${ANAMNESIS_DATA_DIR}/memory
+    glob: ["*.md"]                  # default: ["**/*.md"]
+    store_type: memory
+    store_type_rules:               # first match wins; fnmatch on the file name (or the
+      - {match: "feedback*", store_type: feedback}      # relative path if the pattern has a "/")
+      - {match: "reference*", store_type: reference}
+    # chunker: auto                 # auto | markdown | facts | article | json
+    # weight: 1.0                   # multiplier on the store_type weight
+    # project: default
+    # follow_symlinks: false        # files whose real path leaves `root` are skipped by default
+    # max_files: 50000
+
+  - name: decisions
+    root: ${ANAMNESIS_DATA_DIR}/decisions
+    glob: ["**/*.md"]
+    store_type: decision
+
+  - name: manifests                 # *.json: one chunk per entry, prose for the retriever and
+    root: ${ANAMNESIS_DATA_DIR}/manifests   # the structured original kept in the `metadata` column
+    glob: ["*.json"]
+    store_type: index
+
+  # --- examples of other source classes (disabled) -------------------------------------
+  - name: session-logs
+    enabled: false
+    root: ~/notes/sessions
+    glob: ["**/*.md"]
+    store_type: session_log
+    project: personal
+    weight: 0.8
+
+  - name: project-facts             # `facts` chunker: one chunk per section and per bullet,
+    enabled: false                  # plus an Overview chunk. Good for fact sheets.
+    root: ~/code/my-app/docs
+    glob: ["facts.md", "capabilities.md"]
+    store_type: project_doc
+    project: my-app
+    chunker: facts
+
+  - name: blog
+    enabled: false
+    root: ~/code/site/content
+    glob: ["**/*.md", "**/*.mdx"]
+    store_type: project_doc
+    project: site
+    chunker: article                # metadata chunk (title, tags, date) + structured body chunks
+
+  # --- git_metadata: one synthetic chunk per repository (commits, dates, contributors) -
+  - name: repo-metadata
+    kind: git_metadata
+    enabled: false
+    repos: [~/code/my-app, ~/code/site]
+    store_type: project_meta
+
+  # --- git_branch_docs: docs that exist only on unmerged remote branches ----------------
+  # Staged under $ANAMNESIS_HOME/branch-docs with a PROPOSED-not-merged header.
+  - name: unmerged-docs
+    kind: git_branch_docs
+    enabled: false
+    repo: ~/code/my-app
+    glob: ["docs/*.md", "docs/**/*.md"]
+    base_ref: origin/main
+    store_type: project_doc
+    project: my-app

@@ -1,0 +1,78 @@
+{
+  "entities": [
+    {
+      "id": "machine/build-host",
+      "kind": "Machine",
+      "name": "build-host",
+      "aliases": ["ci-runner"],
+      "attributes": { "role": "ci" }
+    },
+    {
+      "id": "service/api",
+      "kind": "Service",
+      "name": "Example API",
+      "aliases": ["api"],
+      "attributes": { "port": 8080 }
+    },
+    {
+      "id": "service/api-standby",
+      "kind": "Service",
+      "name": "Example API standby",
+      "aliases": [],
+      "attributes": { "role": "standby" }
+    },
+    {
+      "id": "service/docs-builder",
+      "kind": "Service",
+      "name": "Docs builder",
+      "aliases": ["docs-build"],
+      "attributes": {}
+    },
+    {
+      "id": "incident/2026-01-15-api-outage",
+      "kind": "Incident",
+      "name": "2026-01-15 API outage (expired credentials)",
+      "aliases": ["api-outage-jan"],
+      "attributes": { "affected_service": "service/api" }
+    }
+  ],
+  "relations": [
+    {
+      "subject": "service/api",
+      "predicate": "RUNS_ON",
+      "object": "machine/build-host",
+      "valid_from": "2026-01-01"
+    },
+    {
+      "subject": "machine/build-host",
+      "predicate": "HOSTS_SERVICE",
+      "object": "service/api"
+    },
+    {
+      "subject": "service/api",
+      "predicate": "FALLBACK_TO",
+      "object": "service/api-standby"
+    },
+    {
+      "subject": "service/docs-builder",
+      "predicate": "RUNS_ON",
+      "object": "machine/build-host"
+    },
+    {
+      "subject": "project/example-app",
+      "predicate": "DEPENDS_ON",
+      "object": "service/api"
+    },
+    {
+      "subject": "project/docs-site",
+      "predicate": "DEPENDS_ON",
+      "object": "service/docs-builder"
+    },
+    {
+      "subject": "incident/2026-01-15-api-outage",
+      "predicate": "DECIDED_FOR",
+      "object": "service/api",
+      "origin": "human"
+    }
+  ]
+}

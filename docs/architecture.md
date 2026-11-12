@@ -24,8 +24,8 @@ fully embedded, min size) → **keyless Sigstore/Cosign signing** (`cosign sign-
 publish `memory.db` + `manifest.json` + `cosign.bundle` as a **Release asset**.
 `concurrency: index` serializes runs.
 
-The indexer takes **no machine-specific paths** — it is driven by `ANAMNESIS_DATA_ROOT`,
-`ANAMNESIS_OUT`, and `GEMINI_API_KEY` — so the *same script* runs on a runner or a laptop.
+The indexer takes **no machine-specific paths** — it is driven by `ANAMNESIS_DATA_DIR`,
+`ANAMNESIS_DB`, and `GEMINI_API_KEY` — so the *same script* runs on a runner or a laptop.
 `tools/anamnesis-rebuild.sh` is that local twin: any machine can hand-produce a release when
 the CI itself is the broken thing.
 
@@ -34,16 +34,31 @@ the CI itself is the broken thing.
 Each serving machine runs `tools/pull-and-serve.sh` on a timer: fetch the latest Release →
 **verify provenance** (Sigstore/Cosign certificate identity pinned to the repo's main workflow) →
 **verify checksum** (SHA-256 against manifest) → **integrity floor** (min size, chunk count) →
-**atomic `mv`** into place. N replicas, none individually required. In production you front
-them with a small failover proxy so a reader always hits a live one.
+**atomic `mv`** into place. N replicas, none individually required. A reader can use any
+live one.
 
 ### Serving
 
-`tools/recall.py` is a reference reader (FTS5 candidates → embedding cosine rerank). To give
-an agent direct access, wrap the same query in a [Model Context Protocol](https://modelcontextprotocol.io)
-server exposing a `recall` tool over `memory.db`. That server is deliberately outside this
-core kit — it's the easy part. The hard part, and the point of this repo, is the durable
-no-primary write/refresh path above.
+`tools/recall.py` is the retrieval core (FTS5 candidates → embedding cosine rerank, keyword
+fallback when embeddings are unavailable). `tools/mcp_server.py` exposes it, plus writes,
+synthesis, provenance tracing and ontology queries, as [Model Context Protocol](https://modelcontextprotocol.io)
+tools over stdio or HTTP. Two topologies work with the same code:
+
+- **Pipeline + replicas** — CI builds and signs `memory.db`; each replica runs the server
+  with `ANAMNESIS_ROLE=replica` (reads only). Writes are git commits.
+- **Single primary** — one machine indexes and serves; `store_*` tools write memory files
+  (optionally auto-committed) that the next index run embeds. Git remains the source of
+  truth, so the primary is replaceable by a rebuild.
+
+### Ontology
+
+`tools/anamnesis_ontology.py` compiles git-tracked registries (agent rules in
+`CLAUDE.md`/`AGENTS.md`, the decision log, capabilities, entities/contacts — configured in
+`data/dictionary.json`) into rebuildable `ontology_nodes`, `ontology_claims` and
+`ontology_evidence` tables, each row carrying its provenance. Links between chunks use
+stable logical coordinates (`source path + heading slug`) rather than row ids, so a full
+re-index never orphans them. `ontology_impact` answers "what depends on / breaks if X";
+`ontology_audit` reports unresolved links, contradictions and unverified claims.
 
 ## Latency & consistency
 
@@ -60,9 +75,10 @@ Controls, in rough priority:
 | Control | Why |
 |---|---|
 | **Protect the pipeline** — CODEOWNERS/branch-protection on `.github/**` + `tools/**`; data commits touch only `data/**` | The workflow holds the embedding key; a data-write credential must not be able to edit it. |
-| **Verify artifacts before serving** — keyless Sigstore/Cosign signature + SHA-256 checksum + sanity floor before atomic swap | A poisoned release would otherwise become trusted context fleet-wide. Keyless OIDC binds signatures to the repository workflow on `main` without long-lived keys on runners. |
+| **Verify artifacts before serving** — keyless Sigstore/Cosign signature + SHA-256 checksum + sanity floor before atomic swap | A poisoned release would otherwise become trusted context on every replica. Keyless OIDC binds signatures to the repository workflow on `main` without long-lived keys on runners. |
 | **Quarantine high-trust writes** — decisions land on a review branch, merge after a window | A single injected "decision" must not silently become authoritative for every future session. |
 | **Attributable writes** — carry the writer's identity in each commit | So a bad entry is traceable to who/what wrote it. |
+| **Per-client server tokens** — hashed, scoped (read/write), revocable individually; header-only by default; OAuth with an allowlist for GUI connectors | A leaked token is one revocation, never a full rotation, and never sits in a URL. |
 | **Split credentials** — replicas pull with a read-only, releases-scoped token; writers use a separate write token | A compromised read-only replica must not gain write access. |
 
 None of these are exotic; they're the difference between a memory an agent can trust and one

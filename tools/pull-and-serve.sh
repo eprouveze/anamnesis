@@ -27,22 +27,27 @@ if [ -f "${DEST}.manifest.json" ]; then
   fi
 fi
 
-# 2. Download release bundle (memory.db, signature bundle)
-gh release download "$TAG" --repo "$ANAMNESIS_REPO" -p memory.db -p cosign.bundle -D "$TMP_DIR" >/dev/null 2>&1 || \
-gh release download "$TAG" --repo "$ANAMNESIS_REPO" -p memory.db -D "$TMP_DIR"
+# 2. Download release bundle (memory.db + signature bundle)
+gh release download "$TAG" --repo "$ANAMNESIS_REPO" -p memory.db -D "$TMP_DIR" >/dev/null 2>&1 || fail "memory.db missing from release"
+gh release download "$TAG" --repo "$ANAMNESIS_REPO" -p cosign.bundle -D "$TMP_DIR" >/dev/null 2>&1 || true
 
-# 3. Cryptographic signature check (Keyless OIDC bound to this repo's main branch)
-BUNDLE="$(ls "$TMP_DIR"/*cosign.bundle 2>/dev/null | head -n 1 || true)"
-if command -v cosign >/dev/null 2>&1 && [ -n "$BUNDLE" ]; then
-    EXPECTED_IDENTITY="https://github.com/${ANAMNESIS_REPO}/.github/workflows/index.yml@refs/heads/main"
-    cosign verify-blob \
-      --bundle "$BUNDLE" \
-      --certificate-identity-regexp "^${EXPECTED_IDENTITY}$" \
-      --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-      "$TMP_DIR/memory.db" >/dev/null
-    echo "Signature verified via Sigstore/Cosign (Identity: $EXPECTED_IDENTITY)"
+# 3. Signature check: the artifact must have been signed by this repository's index
+# workflow on main (keyless OIDC). The manifest checksum below only proves integrity,
+# not origin, so an unsigned artifact is refused unless ANAMNESIS_ALLOW_UNSIGNED=1.
+BUNDLE="$TMP_DIR/cosign.bundle"
+if command -v cosign >/dev/null 2>&1 && [ -s "$BUNDLE" ]; then
+  EXPECTED_IDENTITY="https://github.com/${ANAMNESIS_REPO}/.github/workflows/index.yml@refs/heads/main"
+  cosign verify-blob \
+    --bundle "$BUNDLE" \
+    --certificate-identity "$EXPECTED_IDENTITY" \
+    --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+    "$TMP_DIR/memory.db" >/dev/null || fail "signature verification failed"
+  echo "Signature verified (identity: $EXPECTED_IDENTITY)"
+elif [ "${ANAMNESIS_ALLOW_UNSIGNED:-0}" = "1" ]; then
+  echo "WARN: serving WITHOUT signature verification (ANAMNESIS_ALLOW_UNSIGNED=1)" >&2
 else
-    echo "WARN: cosign not found on PATH or bundle missing; proceeding with SHA256 integrity check" >&2
+  command -v cosign >/dev/null 2>&1 || fail "cosign not installed (or set ANAMNESIS_ALLOW_UNSIGNED=1 to accept unsigned artifacts)"
+  fail "release has no cosign.bundle (or set ANAMNESIS_ALLOW_UNSIGNED=1)"
 fi
 
 # 4. Checksum verification against manifest + sanity floor

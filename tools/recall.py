@@ -1,203 +1,239 @@
 #!/usr/bin/env python3
-"""anamnesis recall — query a memory.db built by index.py.
+"""anamnesis recall: the retrieval core, plus a small CLI.
 
-Two-stage retrieval, same shape as the production system: FTS5 keyword search to
-gather candidates, then semantic rerank by embedding cosine similarity. This is a
-minimal reference reader (no server); the production serving layer is an MCP server
-that wraps the same query — see docs/architecture.md.
+Two-stage retrieval over a memory.db built by index.py:
 
-    GEMINI_API_KEY=... python tools/recall.py "your question"
+  1. FTS5 keyword search gathers candidates (BM25 order).
+  2. If an embedder is available, candidates are reranked by embedding cosine
+     similarity x store weight x freshness. If it is not (no key, quota exhausted,
+     offline), BM25 rank itself is the relevance signal and the result says so.
 
-Query embeddings are cached (in-process dict + a small SQLite file next to memory.db,
-override with ANAMNESIS_QUERY_CACHE) so a repeated question costs zero API calls and
-an exhausted embedding quota degrades to keyword-only results instead of an error.
+The MCP server (tools/mcp_server.py) calls `search_chunks` directly, so the CLI and
+the server rank identically. Query embedding goes through index.py (`embed_query`),
+which owns the backend choice, the model and the query-embedding cache; this module
+never embeds on its own, so it cannot disagree with the vectors stored in the DB.
+
+    python tools/recall.py "how should I store timestamps?"
+    python tools/recall.py -n 3 --type decision --project demo "retry policy"
+    python tools/recall.py --no-embed "keyword only"
+
+Environment:
+  ANAMNESIS_DB     path to memory.db (default: $ANAMNESIS_HOME/memory.db)
+  ANAMNESIS_HOME   state directory (default: ~/.anamnesis)
 """
 from __future__ import annotations
 
+import argparse
 import contextlib
-import hashlib
+import importlib
+import json
 import math
 import os
 import re
-import struct
 import sqlite3
+import struct
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable, Optional, Sequence
 
-DB = Path(os.environ.get("ANAMNESIS_OUT", "memory.db"))
-MODEL = os.environ.get("ANAMNESIS_EMBEDDING_MODEL", "gemini-embedding-001")
-QUERY_CACHE = Path(os.environ.get("ANAMNESIS_QUERY_CACHE", str(DB) + ".queries.db"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-_MEM: dict[str, list[float]] = {}   # in-process cache; flushed wholesale at _MEM_MAX (capped, not LRU)
-_MEM_MAX = 512
+Embedder = Callable[[str], "list[float]"]
 
 
-def pack(values: list[float]) -> bytes:
-    return struct.pack(f"{len(values)}f", *values)
+def home_dir() -> Path:
+    return Path(os.environ.get("ANAMNESIS_HOME") or (Path.home() / ".anamnesis"))
 
 
-def unpack(blob: bytes) -> list[float]:
-    return list(struct.unpack(f"{len(blob)//4}f", blob))
+def default_db_path() -> Path:
+    return Path(os.environ.get("ANAMNESIS_DB") or (home_dir() / "memory.db"))
 
 
-def cosine(a: list[float], b: list[float]) -> float:
+# --- small pure helpers --------------------------------------------------------------
+
+def unpack_embedding(blob: bytes) -> list[float]:
+    return list(struct.unpack(f"{len(blob) // 4}f", blob))
+
+
+def cosine(a: Sequence[float], b: Sequence[float]) -> float:
+    """Cosine similarity. Vectors of different lengths come from different models and
+    score 0 rather than being silently truncated by zip()."""
+    if len(a) != len(b) or not a:
+        return 0.0
     dot = sum(x * y for x, y in zip(a, b))
-    na = math.sqrt(sum(x * x for x in a)) or 1.0
-    nb = math.sqrt(sum(y * y for y in b)) or 1.0
-    return dot / (na * nb)
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    return dot / (na * nb) if na and nb else 0.0
 
 
-# --- query-embedding cache -------------------------------------------------------------
-
-def cache_key(text: str) -> str:
-    # Whitespace-only normalisation. Case and accents change the embedding, so they must
-    # change the key — lowercasing would serve one casing's vector for the other. The model
-    # is part of the key, so rows from a previous model are simply never served.
-    norm = " ".join(text.split())
-    return hashlib.sha256(f"{MODEL}\n{norm}".encode("utf-8")).hexdigest()
-
-
-def _cache_conn() -> sqlite3.Connection:
-    # Shared by any long-running caller AND short-lived CLI invocations: WAL so readers and
-    # the writer never block each other; a short busy timeout because this sits on the
-    # interactive path — a locked file means "miss", not "wait".
-    # Schema setup is idempotent and cheap, so it runs on every connect rather than being
-    # memoised per path — a memo goes stale if the file is deleted or QUERY_CACHE is reassigned.
-    conn = sqlite3.connect(str(QUERY_CACHE), timeout=0.5)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("""CREATE TABLE IF NOT EXISTS query_embeddings (
-        key TEXT PRIMARY KEY, model TEXT NOT NULL, dim INTEGER NOT NULL,
-        embedding BLOB NOT NULL, created_at TEXT NOT NULL)""")
-    return conn
-
-
-def _cache_get(key: str) -> list[float] | None:
+def freshness_score(timestamp: str | None, now: datetime | None = None) -> float:
+    """0..1 recency decay used only for ranking (not a date). Unknown dates are neutral."""
+    if not timestamp:
+        return 0.5
     try:
-        with contextlib.closing(_cache_conn()) as conn:
-            row = conn.execute("SELECT embedding, dim FROM query_embeddings WHERE key = ? AND model = ?",
-                               (key, MODEL)).fetchone()
-        if not row:
-            return None
-        emb = unpack(row[0])  # a torn blob raises struct.error → caught below → miss
-        if not emb or len(emb) != row[1]:
-            return None  # dimension mismatch → miss
-        return emb
-    except Exception as e:
-        # The cache is an accelerator, never a dependency — but a silent miss hides
-        # contention/corruption, so say so once per call.
-        print(f"query-cache read failed ({type(e).__name__}: {str(e)[:120]}) — treating as miss",
-              file=sys.stderr, flush=True)
-        return None
+        dt = datetime.fromisoformat(str(timestamp)[:10]).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return 0.5
+    days = ((now or datetime.now(timezone.utc)) - dt).days
+    if days <= 7:
+        return 1.0
+    if days <= 30:
+        return 0.8
+    if days <= 90:
+        return 0.5
+    return 0.3
 
 
-def _cache_put(key: str, emb: list[float]) -> None:
-    try:
-        with contextlib.closing(_cache_conn()) as conn:
-            conn.execute("INSERT OR IGNORE INTO query_embeddings (key, model, dim, embedding, created_at)"
-                         " VALUES (?, ?, ?, ?, ?)",
-                         (key, MODEL, len(emb), pack(emb),
-                          datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")))
-            conn.commit()
-    except Exception as e:
-        print(f"query-cache write failed ({type(e).__name__}: {str(e)[:120]}) — vector not cached",
-              file=sys.stderr, flush=True)
+def fts_match_query(text: str) -> str:
+    """Build a safe FTS5 MATCH expression: quoted words OR-ed together.
 
-
-def mock_embedding(text: str, dim: int = 3072) -> list[float]:
-    """Deterministic unit vector derived from text hash for CI/offline use without API keys."""
-    h = hashlib.sha256(text.encode("utf-8")).digest()
-    seed = int.from_bytes(h[:8], "big")
-    vec: list[float] = []
-    val = seed
-    norm_sq = 0.0
-    for _ in range(dim):
-        val = (val * 6364136223846793005 + 1442695040888963407) & 0xFFFFFFFFFFFFFFFF
-        f = (val / 0xFFFFFFFFFFFFFFFF) * 2.0 - 1.0
-        vec.append(f)
-        norm_sq += f * f
-    inv = 1.0 / math.sqrt(norm_sq) if norm_sq > 0 else 1.0
-    return [x * inv for x in vec]
-
-
-def _embed_remote(q: str) -> list[float]:
-    """ONE API call, no retry: a 429 raises immediately so the caller can degrade in
-    milliseconds instead of sleeping through a quota window."""
-    key = os.environ.get("GEMINI_API_KEY")
-    mock_mode = os.environ.get("ANAMNESIS_MOCK_EMBEDDINGS", "").lower() in ("1", "true", "yes")
-    if mock_mode or key in ("mock", "dummy", "placeholder"):
-        dim = int(os.environ.get("ANAMNESIS_EMBEDDING_DIM", "3072"))
-        return mock_embedding(q, dim)
-    if not key:  # raise, don't exit: recall() degrades to keyword-only on an offline replica
-        raise RuntimeError("GEMINI_API_KEY not set (https://aistudio.google.com/apikey)")
-    from google import genai  # after the key check: a replica without the SDK still degrades cleanly
-    client = genai.Client(api_key=key)  # bind — a temporary Client gets GC'd and closes its httpx client mid-call
-    r = client.models.embed_content(model=MODEL, contents=[q])
-    return list(r.embeddings[0].values)
-
-
-def embed_query(q: str) -> list[float]:
-    """Cache-first: in-process dict, then the SQLite cache, then one API call.
-    Cache failures of any kind are misses, never errors. Failed embeds are never cached."""
-    key = cache_key(q)
-    emb = _MEM.get(key)
-    if emb is None:
-        emb = _cache_get(key)
-    if emb is None:
-        emb = _embed_remote(q)
-        _cache_put(key, emb)
-    if len(_MEM) >= _MEM_MAX:
-        _MEM.clear()
-    _MEM[key] = emb
-    return emb
+    Words of 3+ characters are used (shorter ones are noise); if there are none, fall
+    back to whatever words exist. Keeping only word characters neutralises quotes and
+    FTS operators in user text, so arbitrary input can never be a syntax error.
+    """
+    words = re.findall(r"\w+", text)
+    chosen = [w for w in words if len(w) > 2] or words
+    return " OR ".join(f'"{w}"' for w in chosen)
 
 
 # --- retrieval -------------------------------------------------------------------------
 
-def recall(query: str, k: int = 5, candidates: int = 50) -> list[dict]:
-    if not DB.exists():
-        sys.exit(f"{DB} not found — run tools/index.py first.")
-    with contextlib.closing(sqlite3.connect(str(DB))) as conn:
-        fts_q = " OR ".join(re.findall(r"\w+", query)) or query
-        rows = conn.execute(
-            "SELECT c.chunk_id, c.title, c.content, c.store_type, c.weight, c.embedding "
-            "FROM chunks_fts f JOIN chunks c ON c.id = f.rowid "
-            "WHERE chunks_fts MATCH ? ORDER BY bm25(chunks_fts) LIMIT ?",
-            (fts_q, candidates),
-        ).fetchall()
-        fts_hit = bool(rows)
-        if not rows:  # fall back to whole corpus if keywords miss
-            rows = conn.execute(
-                "SELECT chunk_id, title, content, store_type, weight, embedding FROM chunks"
-            ).fetchall()
+def search_chunks(
+    conn: sqlite3.Connection,
+    query: str,
+    *,
+    limit: int = 10,
+    store_types: Optional[Sequence[str]] = None,
+    project: Optional[str] = None,
+    embed: Optional[Embedder] = None,
+    fts_limit: int = 150,
+) -> tuple[list[dict], dict]:
+    """FTS candidates, optionally reranked by embeddings.
+
+    Returns (results, info). Each result carries chunk_id, title, content (full),
+    source_path, store_type, project, score, similarity, freshness, confidence and the
+    raw date columns. `info["mode"]` is "hybrid", "fts" or "none"; `info["embed_error"]`
+    says why an available embedder was not used.
+    """
+    info: dict = {"mode": "none", "candidates": 0}
+    match = fts_match_query(query)
+    if not match:
+        return [], info
+
+    sql = (
+        "SELECT c.*, rank FROM chunks_fts fts JOIN chunks c ON c.id = fts.rowid "
+        "WHERE chunks_fts MATCH ?"
+    )
+    params: list = [match]
+    if store_types:
+        sql += f" AND c.store_type IN ({','.join('?' for _ in store_types)})"
+        params.extend(store_types)
+    if project:
+        sql += " AND c.project = ?"
+        params.append(project)
+    sql += " ORDER BY rank LIMIT ?"
+    params.append(fts_limit)
+
+    cur = conn.cursor()
+    cur.row_factory = sqlite3.Row
+    rows = cur.execute(sql, params).fetchall()
+    info["candidates"] = len(rows)
+    if not rows:
+        return [], info
+
+    top_rank = abs(rows[0]["rank"])
+    fifth_rank = abs(rows[min(4, len(rows) - 1)]["rank"]) if len(rows) > 1 else 0
+    fts_confident = top_rank > 20 and (top_rank - fifth_rank) > 3  # skip the embed call
+
+    qvec = None
+    if embed is not None and not fts_confident:
+        try:
+            qvec = embed(query)
+        except Exception as e:  # no key, quota, network: keyword-only beats nothing
+            info["embed_error"] = type(e).__name__  # class only: messages can carry keys or URLs
+    info["mode"] = "hybrid" if qvec else "fts"
+
+    results = []
+    for row in rows:
+        d = dict(row)
+        blob = d.pop("embedding", None)
+        if qvec and blob:
+            similarity = cosine(qvec, unpack_embedding(blob))
+        else:
+            # BM25 is the relevance signal when there is no query vector.
+            similarity = abs(d["rank"]) / top_rank if top_rank else 0.3
+        fresh = freshness_score(d.get("source_session_at") or d.get("modified_at") or "")
+        weight = d.get("weight") or 1.0
+        score = similarity * fresh * (weight if qvec else 1.0)
+        results.append({
+            **d,
+            "score": round(score, 3),
+            "similarity": round(similarity, 3),
+            "freshness": round(fresh, 2),
+            "confidence": round(min(score / 1.5, 1.0), 2),
+        })
+    results.sort(key=lambda r: r["score"], reverse=True)
+    return results[:limit], info
+
+
+def default_embedder() -> Optional[Embedder]:
+    """Query embedder backed by index.py, or None when it cannot be set up."""
     try:
-        qv = embed_query(query)
+        idx = importlib.import_module("index")
+        client = idx.get_embed_client()
     except Exception as e:
-        # No key / quota exhausted / network down: keyword-only results beat none. Without a
-        # keyword hit there is nothing sensible to rank, so surface the error instead.
-        if not fts_hit:
-            raise
-        print(f"embedding unavailable ({type(e).__name__}: {str(e)[:120]}) — keyword-only results",
-              file=sys.stderr, flush=True)
-        return [{"chunk_id": cid, "title": title, "content": content,
-                 "store_type": stype, "score": None}
-                for cid, title, content, stype, _w, _e in rows[:k]]
-    scored = []
-    for cid, title, content, stype, weight, emb in rows:
-        score = cosine(qv, unpack(emb)) * (weight or 1.0)
-        scored.append({"chunk_id": cid, "title": title, "content": content,
-                       "store_type": stype, "score": round(score, 4)})
-    scored.sort(key=lambda r: r["score"], reverse=True)
-    return scored[:k]
+        print(f"embedding unavailable ({type(e).__name__}); keyword-only",
+              file=sys.stderr)
+        return None
+    return lambda q: idx.embed_query(client, q)
+
+
+def recall(query: str, k: int = 5, *, db: Path | None = None, embed: Optional[Embedder] = None,
+           store_types: Optional[Sequence[str]] = None, project: Optional[str] = None) -> list[dict]:
+    """Convenience wrapper: open the DB, search, return the ranked results."""
+    db = db or default_db_path()
+    if not db.exists():
+        raise FileNotFoundError(f"{db} not found; run tools/index.py first")
+    with contextlib.closing(sqlite3.connect(str(db))) as conn:
+        results, _ = search_chunks(conn, query, limit=k, store_types=store_types,
+                                   project=project, embed=embed)
+    return results
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Search an Anamnesis memory.db")
+    ap.add_argument("query", nargs="+", help="natural-language question")
+    ap.add_argument("-n", "--limit", type=int, default=5)
+    ap.add_argument("--type", dest="store_types", action="append", help="store type filter (repeatable)")
+    ap.add_argument("--project")
+    ap.add_argument("--db", type=Path, default=None)
+    ap.add_argument("--no-embed", action="store_true", help="keyword-only, no embedding call")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args(argv)
+
+    db = args.db or default_db_path()
+    if not db.exists():
+        print(f"{db} not found; run tools/index.py first", file=sys.stderr)
+        return 1
+    embed = None if args.no_embed else default_embedder()
+    with contextlib.closing(sqlite3.connect(str(db))) as conn:
+        results, info = search_chunks(conn, " ".join(args.query), limit=args.limit,
+                                      store_types=args.store_types, project=args.project, embed=embed)
+    if args.json:
+        slim = [{k: r[k] for k in ("chunk_id", "title", "store_type", "project", "score", "content")}
+                for r in results]
+        print(json.dumps({"mode": info["mode"], "results": slim}, indent=2))
+        return 0
+    if not results:
+        print("no results")
+        return 0
+    if info["mode"] == "fts":
+        print("(keyword-only ranking)", file=sys.stderr)
+    for r in results:
+        print(f"[{r['score']}] ({r['store_type']}) {r['title']}\n    {r['content'][:160].strip()}\n")
+    return 0
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        sys.exit('Usage: python tools/recall.py "your question"')
-    try:
-        results = recall(" ".join(sys.argv[1:]))
-    except Exception as e:  # SDK errors are plain Exceptions, not RuntimeError
-        sys.exit(f"recall failed: {e}")
-    for r in results:
-        score = "kw" if r["score"] is None else r["score"]  # "kw" = keyword-only fallback, unranked
-        print(f"[{score}] ({r['store_type']}) {r['title']}\n    {r['content'][:160].strip()}\n")
+    sys.exit(main())
