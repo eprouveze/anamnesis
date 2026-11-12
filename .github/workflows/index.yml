@@ -1,66 +1,104 @@
 name: index
-# Index data/ → embed → sign with Cosign (Keyless OIDC) → publish memory.db as a Release artifact.
-# concurrency:1 serializes the writer; git commit ordering means no split-brain.
+# Index data/ → embed → sign with Cosign (keyless OIDC) → publish memory.db as a Release.
+# Two jobs: "build" runs repository code with a read-only token and no OIDC; only on main
+# does it receive the embedding key. "publish" runs no repository code: it signs and
+# releases the artifact build produced, and exists only for main.
 on:
   push:
-    branches: [main]  # a branch push must never publish a --latest Release (dispatch: see the if: below)
-    paths: ['data/**', 'tools/**', '.github/workflows/index.yml']
+    branches: [main]
+    paths: ['data/**', 'tools/**', 'anamnesis.sources*.yaml', 'requirements.txt', '.github/workflows/index.yml']
   pull_request:
-    paths: ['data/**', 'tools/**', '.github/workflows/index.yml']
+    paths: ['data/**', 'tools/**', 'anamnesis.sources*.yaml', 'requirements.txt', '.github/workflows/index.yml']
   schedule: [{ cron: '0 4 * * *' }]
   workflow_dispatch: {}
-concurrency: { group: index, cancel-in-progress: false }
-permissions:
-  contents: write
-  id-token: write # Required for keyless Sigstore/Cosign OIDC signing
+concurrency: { group: 'index-${{ github.ref }}', cancel-in-progress: false }
+permissions: {}
 jobs:
-  index:
+  build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.12' }
-      - run: pip install --quiet google-genai
-      - uses: sigstore/cosign-installer@v3.8.1
+      - run: pip install --quiet -r requirements.txt
 
-      - name: Build memory.db
+      # Anything not on main (PRs, forks, branch dispatches) builds on the mock backend
+      # with no key in scope. Separate steps, not an expression, so the secret is never
+      # referenced on those runs.
+      - name: Build memory.db (mock embeddings, no secrets)
+        if: github.ref != 'refs/heads/main' || github.event_name == 'pull_request'
+        env:
+          ANAMNESIS_EMBED_BACKEND: mock
+          ANAMNESIS_HOME: ${{ runner.temp }}/anamnesis-home
+          ANAMNESIS_DATA_DIR: ${{ github.workspace }}/data
+          ANAMNESIS_DB: ${{ github.workspace }}/memory.db
+        run: python tools/index.py build
+
+      - name: Build memory.db (main)
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          ANAMNESIS_DATA_ROOT: ${{ github.workspace }}/data
-          ANAMNESIS_OUT: ${{ github.workspace }}/memory.db
-        run: python tools/index.py
+          ANAMNESIS_EMBED_BACKEND: gemini
+          ANAMNESIS_HOME: ${{ runner.temp }}/anamnesis-home
+          ANAMNESIS_DATA_DIR: ${{ github.workspace }}/data
+          ANAMNESIS_DB: ${{ github.workspace }}/memory.db
+        run: python tools/index.py build
 
-      - name: Integrity floor & Manifest
+      - name: Integrity floor & manifest
         run: |
           python - <<'PY'
           import sqlite3, os, json, hashlib
           db_bytes = open("memory.db", "rb").read()
           sha = hashlib.sha256(db_bytes).hexdigest()
-          n = sqlite3.connect("memory.db").execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-          e = sqlite3.connect("memory.db").execute("SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL").fetchone()[0]
+          con = sqlite3.connect("memory.db")
+          n = con.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+          e = con.execute("SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL").fetchone()[0]
           size = len(db_bytes)
           print(f"chunks={n} embedded={e} size={size} sha256={sha[:12]}...")
           assert n >= 1 and e == n and size > 20_000, "integrity floor failed"
-          manifest = {
-              "chunks": n,
-              "embedded": e,
-              "size_bytes": size,
-              "sha256": sha,
-              "source_commit": os.environ.get("GITHUB_SHA", "")
-          }
-          json.dump(manifest, open("manifest.json", "w"), indent=2)
+          json.dump({"chunks": n, "embedded": e, "size_bytes": size, "sha256": sha,
+                     "source_commit": os.environ.get("GITHUB_SHA", "")},
+                    open("manifest.json", "w"), indent=2)
           print("INTEGRITY OK")
           PY
 
-      - name: Sign artifact (Keyless OIDC)
-        if: github.ref == 'refs/heads/main'
-        run: |
-          cosign sign-blob --yes --bundle cosign.bundle memory.db
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        with:
+          name: memory-db
+          path: |
+            memory.db
+            manifest.json
+          retention-days: 1
 
-      - name: Publish Release
-        if: github.ref == 'refs/heads/main'  # workflow_dispatch from a branch builds but never publishes
-        env: { GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
+  publish:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    concurrency: { group: index-publish, cancel-in-progress: false }
+    permissions:
+      contents: write
+      id-token: write   # keyless Sigstore/Cosign signing
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with: { name: memory-db }
+      - uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
+      - name: Sanity check (artifact matches its own manifest; provenance comes from the signature)
         run: |
-          gh release create "build-${{ github.run_number }}" memory.db manifest.json cosign.bundle \
-            --repo "${{ github.repository }}" --latest --title "build-${{ github.run_number }}" \
-            --notes "Auto-indexed, cryptographically signed memory.db from data/."
+          want=$(python3 -c 'import json; print(json.load(open("manifest.json"))["sha256"])')
+          got=$(sha256sum memory.db | cut -d' ' -f1)
+          [ "$want" = "$got" ] || { echo "sha mismatch"; exit 1; }
+      - name: Sign (keyless OIDC)
+        run: cosign sign-blob --yes --bundle cosign.bundle memory.db
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: build-${{ github.run_number }}
+        run: |
+          gh release create "$TAG" memory.db manifest.json cosign.bundle \
+            --repo "$GITHUB_REPOSITORY" --latest --title "$TAG" \
+            --notes "Auto-indexed, signed memory.db."

@@ -15,34 +15,51 @@ command -v gh >/dev/null || fail "gh CLI required (brew/apt install gh)"
 TAG="$(gh release view --repo "$ANAMNESIS_REPO" --json tagName -q .tagName 2>/dev/null || true)"
 [ -n "$TAG" ] || fail "No release found on $ANAMNESIS_REPO"
 
-# 1. Fast-path: Check manifest before downloading large database
+VERIFIED="${DEST}.verified"   # "<sha256 of installed db> <signed|unsigned>", written only after verification
+file_sha() { python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"; }
+
+# 1. Fast-path: skip the download only if the installed DB matches the release AND carries a
+# verification record bound to its exact bytes (signed, unless unsigned is explicitly allowed).
 gh release download "$TAG" --repo "$ANAMNESIS_REPO" -p manifest.json -D "$TMP_DIR" >/dev/null 2>&1 || fail "manifest.json missing from release"
 
-NEW_SHA="$(python3 -c "import json; m=json.load(open('$TMP_DIR/manifest.json')); print(m.get('source_commit', m.get('sha256', 'none')))")"
-if [ -f "${DEST}.manifest.json" ]; then
-  CUR_SHA="$(python3 -c "import json; m=json.load(open('${DEST}.manifest.json')); print(m.get('source_commit', m.get('sha256', 'none')))" 2>/dev/null || echo "old")"
-  if [ "$NEW_SHA" = "$CUR_SHA" ] && [ "$NEW_SHA" != "none" ]; then
+NEW_SHA="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(m.get("source_commit") or "none")' "$TMP_DIR/manifest.json")"
+NEW_DB_SHA="$(python3 -c 'import json,sys; s=json.load(open(sys.argv[1])).get("sha256"); print((s.get("memory.db") if isinstance(s, dict) else s) or "none")' "$TMP_DIR/manifest.json")"
+if [ -f "${DEST}.manifest.json" ] && [ -f "$DEST" ] && [ -f "$VERIFIED" ]; then
+  CUR_SHA="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(m.get("source_commit") or "none")' "${DEST}.manifest.json" 2>/dev/null || echo "old")"
+  read -r REC_SHA REC_MODE _ < "$VERIFIED" || true
+  MODE_OK=0
+  { [ "${REC_MODE:-}" = "signed" ] || [ "${ANAMNESIS_ALLOW_UNSIGNED:-0}" = "1" ]; } && MODE_OK=1
+  if [ "$NEW_SHA" = "$CUR_SHA" ] && [ "$NEW_SHA" != "none" ] && [ "$MODE_OK" = 1 ] \
+     && [ "$NEW_DB_SHA" != "none" ] && [ "${REC_SHA:-}" = "$NEW_DB_SHA" ] \
+     && [ "${REC_SHA:-}" = "$(file_sha "$DEST")" ]; then
     echo "Anamnesis replica up to date ($TAG: $NEW_SHA)"
     exit 0
   fi
 fi
 
-# 2. Download release bundle (memory.db, signature bundle)
-gh release download "$TAG" --repo "$ANAMNESIS_REPO" -p memory.db -p cosign.bundle -D "$TMP_DIR" >/dev/null 2>&1 || \
-gh release download "$TAG" --repo "$ANAMNESIS_REPO" -p memory.db -D "$TMP_DIR"
+# 2. Download release bundle (memory.db + signature bundle)
+gh release download "$TAG" --repo "$ANAMNESIS_REPO" -p memory.db -D "$TMP_DIR" >/dev/null 2>&1 || fail "memory.db missing from release"
+gh release download "$TAG" --repo "$ANAMNESIS_REPO" -p cosign.bundle -D "$TMP_DIR" >/dev/null 2>&1 || true
 
-# 3. Cryptographic signature check (Keyless OIDC bound to this repo's main branch)
-BUNDLE="$(ls "$TMP_DIR"/*cosign.bundle 2>/dev/null | head -n 1 || true)"
-if command -v cosign >/dev/null 2>&1 && [ -n "$BUNDLE" ]; then
-    EXPECTED_IDENTITY="https://github.com/${ANAMNESIS_REPO}/.github/workflows/index.yml@refs/heads/main"
-    cosign verify-blob \
-      --bundle "$BUNDLE" \
-      --certificate-identity-regexp "^${EXPECTED_IDENTITY}$" \
-      --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-      "$TMP_DIR/memory.db" >/dev/null
-    echo "Signature verified via Sigstore/Cosign (Identity: $EXPECTED_IDENTITY)"
+# 3. Signature check: the artifact must have been signed by this repository's index
+# workflow on main (keyless OIDC). The manifest checksum below only proves integrity,
+# not origin, so an unsigned artifact is refused unless ANAMNESIS_ALLOW_UNSIGNED=1.
+BUNDLE="$TMP_DIR/cosign.bundle"
+if command -v cosign >/dev/null 2>&1 && [ -s "$BUNDLE" ]; then
+  EXPECTED_IDENTITY="https://github.com/${ANAMNESIS_REPO}/.github/workflows/index.yml@refs/heads/main"
+  cosign verify-blob \
+    --bundle "$BUNDLE" \
+    --certificate-identity "$EXPECTED_IDENTITY" \
+    --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+    "$TMP_DIR/memory.db" >/dev/null || fail "signature verification failed"
+  echo "Signature verified (identity: $EXPECTED_IDENTITY)"
+  VERIFY_MODE=signed
+elif [ "${ANAMNESIS_ALLOW_UNSIGNED:-0}" = "1" ]; then
+  echo "WARN: serving WITHOUT signature verification (ANAMNESIS_ALLOW_UNSIGNED=1)" >&2
+  VERIFY_MODE=unsigned
 else
-    echo "WARN: cosign not found on PATH or bundle missing; proceeding with SHA256 integrity check" >&2
+  command -v cosign >/dev/null 2>&1 || fail "cosign not installed (or set ANAMNESIS_ALLOW_UNSIGNED=1 to accept unsigned artifacts)"
+  fail "release has no cosign.bundle (or set ANAMNESIS_ALLOW_UNSIGNED=1)"
 fi
 
 # 4. Checksum verification against manifest + sanity floor
@@ -58,8 +75,8 @@ assert os.path.exists(manifest_path), "manifest.json missing"
 manifest = json.load(open(manifest_path))
 actual_sha = hashlib.sha256(open(db_path, "rb").read()).hexdigest()
 want_sha = manifest["sha256"]["memory.db"] if isinstance(manifest.get("sha256"), dict) else manifest.get("sha256")
-if want_sha:
-    assert actual_sha == want_sha, f"SHA256 mismatch: {actual_sha} vs {want_sha}"
+assert want_sha, "manifest has no sha256 for memory.db"
+assert actual_sha == want_sha, f"SHA256 mismatch: {actual_sha} vs {want_sha}"
 
 # Sanity floor check
 assert os.path.getsize(db_path) > 20_000, "Artifact size below 20KB sanity floor"
@@ -71,6 +88,8 @@ PY
 # 5. Atomic swap on the same filesystem
 STAGE="$(dirname "$DEST")/.memory.db.incoming.$$"
 cp "$TMP_DIR/memory.db" "$STAGE"
+rm -f "$VERIFIED"
 mv -f "$STAGE" "$DEST"
 cp "$TMP_DIR/manifest.json" "${DEST}.manifest.json"
+printf '%s %s\n' "$(file_sha "$DEST")" "$VERIFY_MODE" > "$VERIFIED.tmp" && mv -f "$VERIFIED.tmp" "$VERIFIED"
 echo "Served verified memory: $DEST ($TAG)"
