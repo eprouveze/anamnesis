@@ -161,8 +161,9 @@ def search_chunks(
         if qvec and blob:
             similarity = cosine(qvec, unpack_embedding(blob))
         elif qvec:
-            # Hybrid mode, unembedded chunk: a flat fallback, so BM25 (0..1) cannot outrank cosine.
-            similarity = 0.3
+            # Hybrid mode, unembedded chunk: keep the BM25 ordering, scaled into 0..0.6 so a
+            # keyword-only match ranks alongside (not above) a strong embedding match.
+            similarity = 0.6 * abs(d["rank"]) / top_rank if top_rank else 0.3
         else:
             # BM25 is the relevance signal when there is no query vector.
             similarity = abs(d["rank"]) / top_rank if top_rank else 0.3

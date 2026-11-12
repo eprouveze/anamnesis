@@ -23,12 +23,14 @@ file_sha() { python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[
 gh release download "$TAG" --repo "$ANAMNESIS_REPO" -p manifest.json -D "$TMP_DIR" >/dev/null 2>&1 || fail "manifest.json missing from release"
 
 NEW_SHA="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(m.get("source_commit") or "none")' "$TMP_DIR/manifest.json")"
+NEW_DB_SHA="$(python3 -c 'import json,sys; s=json.load(open(sys.argv[1])).get("sha256"); print((s.get("memory.db") if isinstance(s, dict) else s) or "none")' "$TMP_DIR/manifest.json")"
 if [ -f "${DEST}.manifest.json" ] && [ -f "$DEST" ] && [ -f "$VERIFIED" ]; then
   CUR_SHA="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(m.get("source_commit") or "none")' "${DEST}.manifest.json" 2>/dev/null || echo "old")"
   read -r REC_SHA REC_MODE _ < "$VERIFIED" || true
   MODE_OK=0
   { [ "${REC_MODE:-}" = "signed" ] || [ "${ANAMNESIS_ALLOW_UNSIGNED:-0}" = "1" ]; } && MODE_OK=1
   if [ "$NEW_SHA" = "$CUR_SHA" ] && [ "$NEW_SHA" != "none" ] && [ "$MODE_OK" = 1 ] \
+     && [ "$NEW_DB_SHA" != "none" ] && [ "${REC_SHA:-}" = "$NEW_DB_SHA" ] \
      && [ "${REC_SHA:-}" = "$(file_sha "$DEST")" ]; then
     echo "Anamnesis replica up to date ($TAG: $NEW_SHA)"
     exit 0

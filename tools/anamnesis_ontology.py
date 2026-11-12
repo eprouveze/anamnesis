@@ -1418,7 +1418,8 @@ def compile_ontology(
     through `LAST_COMPILE_WARNINGS` / the `warnings` count, never silently dropped.
     """
     ensure_ontology_schema(conn)
-    backfill_chunk_coordinates(conn)  # evidence rows bind to chunk_key; fill any missing first
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone():
+        backfill_chunk_coordinates(conn)  # evidence rows bind to chunk_key; fill any missing first
     root = repo_root or default_repo_root()
     home = home_dir or Path.home()
 

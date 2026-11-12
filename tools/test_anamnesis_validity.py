@@ -216,6 +216,17 @@ class TestGateAndCli(ValidityCase):
         conn = sqlite3.connect(str(self.db))
         self.assertTrue(conn.execute("SELECT valid_to FROM nugget_links WHERE id=1").fetchone()[0])
 
+    def test_switching_database_restarts_the_shadow_window(self):
+        self.make_db()
+        self.shadow(31)
+        other = self.db.with_name("other.db")
+        self.make_db(path=other).close()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(validity.main(["--db", str(other), "shadow"]), 0)
+        rec = validity.load_shadow()
+        self.assertEqual(rec["db"], str(other.resolve()))
+        self.assertIn("need 30d", " ".join(validity.gate_decision()["reasons"]))
+
     def test_apply_refuses_a_database_the_shadow_run_did_not_measure(self):
         self.make_db()
         self.shadow(31)

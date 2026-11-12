@@ -28,7 +28,9 @@ python3.12 -m venv .venv && . .venv/bin/activate   # Python 3.12+
 pip install -r requirements.txt
 
 export GEMINI_API_KEY=...                    # or ANAMNESIS_EMBED_BACKEND=mock / local
-# local backend only: pip install sentence-transformers torch
+# local backend only: pip install sentence-transformers torch. Its default model
+# (google/embeddinggemma-300m) is gated on Hugging Face: accept the license and set HF_TOKEN,
+# or point ANAMNESIS_LOCAL_MODEL at an ungated sentence-transformers model.
 python tools/index.py build                  # data/ → ~/.anamnesis/memory.db
 python tools/recall.py "how should I store timestamps?"
 ```

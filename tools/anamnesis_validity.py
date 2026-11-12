@@ -517,7 +517,10 @@ def record_shadow_run(conn: sqlite3.Connection, db_path: Path | None = None) -> 
     """
     result = compute_supersessions(conn)
     shadow = load_shadow()
-    shadow["db"] = _db_identity(db_path)
+    identity = _db_identity(db_path)
+    if shadow.get("db") != identity:
+        shadow["started_at"] = None  # a different database starts its own observation window
+    shadow["db"] = identity
     shadow["started_at"] = shadow.get("started_at") or _now_iso()
     shadow["updated_at"] = _now_iso()
     shadow["verdicts"] = result["verdicts"]

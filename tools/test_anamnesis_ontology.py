@@ -290,6 +290,11 @@ class TestSupersession(OntologyCase):
 
 
 class TestCompiler(OntologyCase):
+    def test_registry_only_compile_works_without_a_chunks_table(self):
+        conn = sqlite3.connect(":memory:")
+        stats = ontology.compile_ontology(conn, repo_root=self.root, link_evidence=False)
+        self.assertGreater(stats["nodes"], 0)
+
     def test_registries_compile_and_bad_entries_warn(self):
         stats = self.compile(link_evidence=False)
         self.assertGreater(stats["nodes"], 8)

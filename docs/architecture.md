@@ -58,7 +58,9 @@ tools over stdio or HTTP. Two topologies work with the same code:
 `ontology_evidence` tables, each row carrying its provenance. Links between chunks use
 stable logical coordinates (`source path + heading slug`) rather than row ids, so a full
 re-index rebinds them as long as the file path and heading are unchanged. Renaming either
-changes the key; `ontology_audit` then lists the link as unresolved until it is repaired. `ontology_impact` answers "what depends on / breaks if X";
+changes the key: `ontology_audit` then counts the link as unresolved, and
+`SELECT id, from_chunk_id, target_source_path, target_heading_slug FROM nugget_links
+WHERE resolution_status = 'unresolved'` lists the rows to repair. `ontology_impact` answers "what depends on / breaks if X";
 `ontology_audit` reports unresolved links, contradictions and unverified claims.
 
 ## Latency & consistency
