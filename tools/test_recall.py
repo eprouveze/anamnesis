@@ -1,162 +1,157 @@
-"""Tests for the query-embedding cache in recall.py. No API key, no network:
-_embed_remote is stubbed and counted.
+"""Tests for the retrieval core in recall.py. No API key, no network: the embedder is a stub.
 
     python -m unittest discover -s tools -p 'test_*.py' -v
 """
 from __future__ import annotations
 
-import os
+import contextlib
+import io
 import sqlite3
+import struct
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent))
-import index  # noqa: E402
 import recall  # noqa: E402
 
-VEC = [0.5, 0.25, 0.125, 1.0]  # exactly representable in float32 (the cache stores f32)
+VEC = [0.5, 0.25, 0.125, 1.0]
+ORTHO = [1.0, 0.0, 0.0, 0.0]
 
 
-class CacheTests(unittest.TestCase):
+def pack(values):
+    return struct.pack(f"{len(values)}f", *values)
+
+
+SCHEMA = """
+CREATE TABLE chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, chunk_id TEXT UNIQUE NOT NULL, store_type TEXT NOT NULL,
+    source_path TEXT NOT NULL, title TEXT, content TEXT NOT NULL, embedding BLOB,
+    created_at TEXT, modified_at TEXT, project TEXT, topic_ids TEXT, weight REAL DEFAULT 1.0,
+    indexed_at TEXT NOT NULL);
+CREATE VIRTUAL TABLE chunks_fts USING fts5(chunk_id, title, content, store_type, project, topic_ids,
+    content=chunks, content_rowid=id, tokenize='porter unicode61');
+"""
+
+
+def make_db(path: Path, rows) -> None:
+    conn = sqlite3.connect(str(path))
+    conn.executescript(SCHEMA)
+    for i, (cid, title, body, stype, project, emb) in enumerate(rows, start=1):
+        conn.execute(
+            "INSERT INTO chunks (id, chunk_id, store_type, source_path, title, content, embedding,"
+            " modified_at, project, topic_ids, weight, indexed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (i, cid, stype, "t.md", title, body, pack(emb) if emb else None,
+             "2020-01-01", project, "", 1.0, "2020-01-01T00:00:00Z"))
+    conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')")
+    conn.commit()
+    conn.close()
+
+
+class HelperTests(unittest.TestCase):
+    def test_cosine_identical_and_mismatched(self):
+        self.assertAlmostEqual(recall.cosine(VEC, VEC), 1.0, places=6)
+        self.assertEqual(recall.cosine(VEC, [1.0, 2.0]), 0.0)
+        self.assertEqual(recall.cosine([], []), 0.0)
+
+    def test_fts_query_is_safe_for_hostile_input(self):
+        q = recall.fts_match_query('foo" OR NEAR(bar) * -baz:')
+        self.assertNotIn("*", q)
+        self.assertNotIn("(", q)
+        self.assertEqual(recall.fts_match_query("!!! ???"), "")
+
+    def test_short_words_dropped_unless_nothing_else(self):
+        self.assertEqual(recall.fts_match_query("a to retry"), '"retry"')
+        self.assertEqual(recall.fts_match_query("a to"), '"a" OR "to"')
+
+
+class SearchTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.cache = Path(self.tmp.name) / "q.db"
-        self._patches = [
-            mock.patch.object(recall, "QUERY_CACHE", self.cache),
-            mock.patch.object(recall, "_MEM", {}),
-        ]
-        for p in self._patches:
-            p.start()
-        self.calls = 0
-
-        def fake_remote(q):
-            self.calls += 1
-            return list(VEC)
-        self._remote = mock.patch.object(recall, "_embed_remote", side_effect=fake_remote)
-        self._remote.start()
+        self.db = Path(self.tmp.name) / "memory.db"
+        make_db(self.db, [
+            ("c0", "timestamps", "store timestamps as UTC ISO strings", "memory", "demo", VEC),
+            ("c1", "naming", "prefer kebab-case slugs for filenames", "decision", "demo", ORTHO),
+            ("c2", "retries", "timestamps in retry logs help debugging", "decision", "other", ORTHO),
+        ])
+        self.conn = sqlite3.connect(str(self.db))
 
     def tearDown(self):
-        self._remote.stop()
-        for p in self._patches:
-            p.stop()
+        self.conn.close()
         self.tmp.cleanup()
 
-    def test_second_call_hits_in_process_cache(self):
-        recall.embed_query("hello world")
-        recall.embed_query("hello world")
-        self.assertEqual(self.calls, 1)
+    def test_semantic_rerank_prefers_closest_vector(self):
+        res, info = recall.search_chunks(self.conn, "timestamps", embed=lambda q: list(VEC))
+        self.assertEqual(info["mode"], "hybrid")
+        self.assertEqual(res[0]["chunk_id"], "c0")
+        self.assertNotIn("embedding", res[0])
 
-    def test_sqlite_cache_survives_new_process(self):
-        recall.embed_query("hello world")
-        recall._MEM.clear()          # simulate a fresh short-lived CLI process
-        self.assertEqual(recall.embed_query("hello world"), VEC)
-        self.assertEqual(self.calls, 1)
+    def test_keyword_only_when_embedder_fails(self):
+        def boom(_q):
+            raise RuntimeError("429 quota key=sk-SECRET")
+        res, info = recall.search_chunks(self.conn, "timestamps", embed=boom)
+        self.assertEqual(info["mode"], "fts")
+        self.assertEqual(info["embed_error"], "RuntimeError")  # class only, never the message
+        self.assertEqual({r["chunk_id"] for r in res}, {"c0", "c2"})
 
-    def test_key_normalises_whitespace_only(self):
-        self.assertEqual(recall.cache_key("a  b\n c"), recall.cache_key("a b c"))
-        self.assertNotEqual(recall.cache_key("Hello"), recall.cache_key("hello"))
+    def test_no_embedder_is_keyword_only(self):
+        res, info = recall.search_chunks(self.conn, "kebab")
+        self.assertEqual(info["mode"], "fts")
+        self.assertEqual([r["chunk_id"] for r in res], ["c1"])
 
-    def test_model_change_never_serves_other_models_rows(self):
-        recall.embed_query("hello world")
-        with mock.patch.object(recall, "MODEL", "other-model"), mock.patch.object(recall, "_MEM", {}):
-            recall.embed_query("hello world")
-        self.assertEqual(self.calls, 2)
-        rows = sqlite3.connect(str(self.cache)).execute(
-            "SELECT model FROM query_embeddings ORDER BY model").fetchall()
-        self.assertEqual(rows, [(recall.MODEL,), ("other-model",)])  # both kept; a read never deletes
+    def test_filters_apply_in_sql_before_the_limit(self):
+        res, _ = recall.search_chunks(self.conn, "timestamps", store_types=["decision"])
+        self.assertEqual([r["chunk_id"] for r in res], ["c2"])
+        res, _ = recall.search_chunks(self.conn, "timestamps", project="demo")
+        self.assertEqual([r["chunk_id"] for r in res], ["c0"])
 
-    def test_missing_api_key_raises_not_exits(self):
-        self._remote.stop()
-        with mock.patch.dict(os.environ, {}, clear=True):
-            with self.assertRaises(RuntimeError):
-                recall._embed_remote("hello world")
-        self._remote.start()
+    def test_no_match_and_empty_query(self):
+        self.assertEqual(recall.search_chunks(self.conn, "zzzzqqq")[0], [])
+        res, info = recall.search_chunks(self.conn, "!!!")
+        self.assertEqual((res, info["mode"]), ([], "none"))
 
-    def test_read_path_is_read_only(self):
-        recall.embed_query("hello world")
-        recall._MEM.clear()
-        self.cache.chmod(0o444)  # a read-only cache file must still serve hits
-        try:
-            self.assertEqual(recall.embed_query("hello world"), VEC)
-        finally:
-            self.cache.chmod(0o644)
-        self.assertEqual(self.calls, 1)
-
-    def test_cache_failure_is_a_miss_not_an_error(self):
-        bad = Path(self.tmp.name) / "missing-dir" / "q.db"
-        with mock.patch.object(recall, "QUERY_CACHE", bad):
-            self.assertEqual(recall.embed_query("hello world"), VEC)
-        self.assertEqual(self.calls, 1)
-
-    def test_failed_embed_is_not_cached(self):
-        self._remote.stop()
-        with mock.patch.object(recall, "_embed_remote", side_effect=RuntimeError("429")):
-            with self.assertRaises(RuntimeError):
-                recall.embed_query("hello world")
-        self._remote.start()
-        self.assertEqual(sqlite3.connect(str(self.cache)).execute(
-            "SELECT COUNT(*) FROM query_embeddings").fetchone()[0], 0)
-
-
-class RecallDegradeTests(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        db = Path(self.tmp.name) / "memory.db"
-        conn = index.init_db(db)
-        for i, (title, body) in enumerate([("timestamps", "store timestamps as UTC ISO strings"),
-                                           ("naming", "prefer kebab-case slugs")]):
-            conn.execute("INSERT INTO chunks (id, chunk_id, title, content, store_type, source, weight,"
-                         " embedding, indexed_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                         (i + 1, f"c{i}", title, body, "memory", "t.md", 1.0, recall.pack(VEC), "now"))
-        conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')")
-        conn.commit()
-        conn.close()
-        self._db = mock.patch.object(recall, "DB", db)
-        self._db.start()
-        self._mem = mock.patch.object(recall, "_MEM", {})
-        self._mem.start()
-        self._cache = mock.patch.object(recall, "QUERY_CACHE", Path(self.tmp.name) / "q.db")
-        self._cache.start()
-
-    def tearDown(self):
-        for p in (self._cache, self._mem, self._db):
-            p.stop()
-        self.tmp.cleanup()
-
-    def test_keyword_only_when_embedding_fails(self):
-        with mock.patch.object(recall, "_embed_remote", side_effect=RuntimeError("429")):
-            rows = recall.recall("timestamps")
-        self.assertEqual([r["chunk_id"] for r in rows], ["c0"])
-        self.assertIsNone(rows[0]["score"])
-
-    def test_embedding_failure_without_keyword_hit_raises(self):
-        with mock.patch.object(recall, "_embed_remote", side_effect=RuntimeError("429")):
-            with self.assertRaises(RuntimeError):
-                recall.recall("zzzz")
+    def test_limit(self):
+        res, _ = recall.search_chunks(self.conn, "timestamps", limit=1)
+        self.assertEqual(len(res), 1)
 
     def test_candidate_pool_is_best_keyword_matches(self):
-        # 60 chunks match "timestamps"; the densest keyword match sits at the highest rowid so a
-        # rowid-ordered LIMIT would drop it. bm25 ordering must keep it in the pool of 50.
-        conn = sqlite3.connect(str(recall.DB))
-        for i in range(60):
-            body = "timestamps " * (10 if i == 59 else 1) + f"filler {i}"
-            conn.execute("INSERT INTO chunks (id, chunk_id, title, content, store_type, source, weight,"
-                         " embedding, indexed_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                         (100 + i, f"d{i}", "t", body, "memory", "t.md", 1.0, recall.pack(VEC), "now"))
-        conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')")
-        conn.commit(); conn.close()
-        with mock.patch.object(recall, "_embed_remote", side_effect=RuntimeError("429")):
-            rows = recall.recall("timestamps", k=1)
-        self.assertEqual(rows[0]["chunk_id"], "d59")
+        # The densest keyword match sits at the highest rowid, so a rowid-ordered LIMIT
+        # would drop it; BM25 ordering must keep it in the pool.
+        rows = [(f"d{i}", "t", "timestamps " * (10 if i == 59 else 1) + f"filler {i}", "memory", "demo", None)
+                for i in range(60)]
+        db = Path(self.tmp.name) / "big.db"
+        make_db(db, rows)
+        conn = sqlite3.connect(str(db))
+        try:
+            res, _ = recall.search_chunks(conn, "timestamps", limit=1, fts_limit=10)
+        finally:
+            conn.close()
+        self.assertEqual(res[0]["chunk_id"], "d59")
 
-    def test_semantic_path_unchanged(self):
-        with mock.patch.object(recall, "_embed_remote", return_value=list(VEC)):
-            rows = recall.recall("timestamps")
-        self.assertEqual(rows[0]["chunk_id"], "c0")
-        self.assertAlmostEqual(rows[0]["score"], 1.0, places=3)
+
+class CliTests(unittest.TestCase):
+    def test_cli_missing_db_returns_error(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(recall.main(["--db", str(Path(tmp) / "nope.db"), "hello"]), 1)
+
+    def test_cli_keyword_only_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "memory.db"
+            make_db(db, [("c0", "timestamps", "store timestamps as UTC", "memory", "demo", None)])
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = recall.main(["--db", str(db), "--no-embed", "--json", "timestamps"])
+        self.assertEqual(rc, 0)
+        self.assertIn('"c0"', out.getvalue())
+
+    def test_default_db_path_honours_env(self):
+        import os
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"ANAMNESIS_DB": "/x/y.db"}):
+            self.assertEqual(recall.default_db_path(), Path("/x/y.db"))
+        with mock.patch.dict(os.environ, {"ANAMNESIS_HOME": "/h"}, clear=True):
+            self.assertEqual(recall.default_db_path(), Path("/h/memory.db"))
 
 
 if __name__ == "__main__":

@@ -7,113 +7,102 @@ alongside [heartbeat](https://github.com/eprouveze/heartbeat) (the loop) and
 [rightmodel](https://github.com/eprouveze/rightmodel) (routing & trust).
 
 An agent that operates as a custodian of your work over months needs memory that is
-durable, resilient, and yours. This is the genericized core of one such system.
+durable, resilient, and yours.
 
 > **The DB is a build artifact. Git is the write-ahead log. The writer is a pipeline.**
 
-Memory entries are **git commits** (markdown/JSON under `data/`). A **GitHub Actions
-pipeline** indexes and embeds them into a `memory.db` (SQLite FTS5 + vector rerank),
-cryptographically signs the build artifact with **keyless Sigstore/Cosign**, and
-publishes it as a **Release artifact**. Every machine is a disposable replica that pulls
-the artifact, verifies its provenance signature, and serves it. Lose any machine — or all of
-them — and the write path still works (git commits queue offline) and the index rebuilds anywhere.
+Memory entries are **git commits** (markdown/JSON under `data/`, plus any other roots you
+list in a sources config). The indexer chunks and embeds them into a `memory.db` (SQLite
+FTS5 + vector rerank + a materialized ontology). A pipeline can build it in CI, sign it
+with **keyless Sigstore/Cosign** and publish it as a Release; every machine is then a
+disposable replica that verifies and serves it. Or run one primary writer and serve it
+directly over MCP. Either way the database is rebuildable from git.
 
-> These are working tools with rough edges, not a polished product. The author runs a
-> heavily-extended, private instance of this daily; this repo is the genericized core you
-> can build on.
-
-## Why it's shaped this way
-
-Most "agent memory" designs quietly depend on one machine or one hosted database being up.
-When that primary dies, writing and refreshing memory stops. The trick here: **if your
-sources already live in git, the database is a *derived* artifact** — rebuild it anywhere
-from the sources plus an embeddings cache, and the "primary machine" concept disappears.
+> Working tools with rough edges, not a polished product.
 
 ## Quickstart
 
 ```bash
 git clone https://github.com/eprouveze/anamnesis && cd anamnesis
-export GEMINI_API_KEY=...          # https://aistudio.google.com/apikey
-pip install google-genai
+python3.12 -m venv .venv && . .venv/bin/activate   # Python 3.12+
+pip install -r requirements.txt
 
-python tools/index.py                       # build memory.db from data/
+export GEMINI_API_KEY=...                    # or ANAMNESIS_EMBED_BACKEND=mock / local
+# local backend only: pip install sentence-transformers torch. Its default model
+# (google/embeddinggemma-300m) is gated on Hugging Face: accept the license and set HF_TOKEN,
+# or point ANAMNESIS_LOCAL_MODEL at an ungated sentence-transformers model.
+python tools/index.py build                  # data/ → ~/.anamnesis/memory.db
 python tools/recall.py "how should I store timestamps?"
 ```
 
-To run it as a pipeline: add `GEMINI_API_KEY` as an Actions secret, commit a memory under
-`data/memory/`, and push — the `index` workflow builds, signs, and publishes a `memory.db` Release.
-Point your replicas at it with `tools/pull-and-serve.sh`.
+To index more than `data/`, copy `anamnesis.sources.example.yaml`, list your roots, and
+point `ANAMNESIS_SOURCES` at it.
 
 ## What's here
 
 | Path | Role |
 |---|---|
-| `tools/index.py` | the indexer — `data/` → embed → `memory.db` (env-driven, runs anywhere) |
-| `tools/recall.py` | reference reader — FTS5 candidates → embedding rerank; query embeddings cached, keyword-only fallback when the API is unavailable |
-| `tools/test_recall.py` | unit tests for the cache and fallback — stdlib only, no API key |
+| `tools/index.py` | indexer: sources config → chunk → embed (Gemini, local sentence-transformers, or mock) → `memory.db`; spend caps, retry/backoff, partial-embed degrade, chat-export import |
+| `tools/recall.py` | retrieval core (FTS5 candidates → embedding rerank, keyword fallback) + CLI |
+| `tools/mcp_server.py` | MCP server (stdio or streamable HTTP): 18 tools, hashed per-client tokens, optional OAuth |
+| `tools/anamnesis_ontology.py` | registry compiler → `ontology_nodes/claims/evidence`; impact & audit queries; stable link coordinates |
+| `tools/anamnesis_dict.py` | loads `data/dictionary.json` (projects, node kinds, predicates, store weights, registries) |
+| `tools/anamnesis_validity.py` | link-validity / supersession schema used by recall |
+| `tools/anamnesis_redact.py` | shared secret-redaction patterns for imported text |
+| `tools/anamnesis_llm.py` | opt-in LLM helper for dream/decay judging (no default remote provider) |
+| `tools/dream.py` | periodic memory consolidation (orient → gather → consolidate → prune), dry-run by default |
+| `tools/decay.py` | propose-only value-decay review of curated facts |
+| `tools/wiki_link_resolver.py` | deterministic `[[wiki-link]]` edge resolver |
+| `tools/chat_import.py`, `tools/ingest_conversation.py` | import chat exports / clip LLM conversations into memory (with secret redaction) |
+| `tools/eval_recall.py` | recall quality eval against a golden set (LLM or heuristic judge) |
 | `tools/pull-and-serve.sh` | replica: pull latest Release → verify (Cosign OIDC + SHA256) → atomic swap |
-| `tools/anamnesis-rebuild.sh` | local twin of the pipeline (recovery when CI is down) |
-| `.github/workflows/index.yml` | the pipeline — index + sign with Cosign + publish on push + nightly |
-| `.github/workflows/smoke.yml` | prove your key works in CI (one embedding call) |
-| `.github/workflows/test.yml` | unit tests on every PR — no secrets needed |
-| `data/` | your memory (markdown), decisions, and structured manifests — the example corpus ships so it builds out of the box |
-| `docs/` | [architecture](docs/architecture.md) · [operations](docs/operations.md) |
+| `tools/anamnesis-rebuild.sh` | local twin of the CI pipeline |
+| `.github/workflows/` | `test` (every PR, no secrets) · `index` (build + sign + publish on main) · `smoke` (manual key check) |
+| `data/` | example memory, decisions, manifests and `dictionary.json` — builds out of the box |
+| `docs/` | [architecture](docs/architecture.md) · [operations](docs/operations.md) · [dictionary](docs/dictionary.md) |
 
-## Design in one diagram
+## Serving to an agent via MCP
 
-```
-WRITE (any device, offline-ok)    BUILD & SIGN (no machine required)      SERVE (disposable replicas)
-  memory = git commit to data/ ─►  GitHub Actions (concurrency:1) ──────►  pull latest Release →
-  (phone, laptop, agent, CI)       index + embed + Cosign sign → memory.db  verify signature → atomic swap
-```
-
-## Security: Preventing Belief Breaches
-
-When your memory database is a downloadable file, an attacker who compromises a write token
-could publish a poisoned memory artifact with a matching checksum. The agent would read it,
-trust it, and act on it.
-
-To prevent this, every release artifact is cryptographically signed using **keyless Sigstore/Cosign**
-during the GitHub Actions run. Replicas run `tools/pull-and-serve.sh` to verify that the artifact
-was built by *this exact repository workflow on `main`* before swapping it into service.
-
-## Serving to an Agent via MCP (Claude Code, Codex, Cursor)
-
-Anamnesis includes a native **Model Context Protocol (MCP)** server in `tools/mcp_server.py`.
-
-### 1. Add to Claude Code
+Local (stdio — trusted, no token):
 ```bash
-claude mcp add anamnesis -e GEMINI_API_KEY=your_key -- python /path/to/anamnesis/tools/mcp_server.py
+# single quotes: the client stores the ${GEMINI_API_KEY} reference and expands it at launch,
+# so the key itself never lands in its config file
+claude mcp add anamnesis -e 'GEMINI_API_KEY=${GEMINI_API_KEY}' -- \
+  /path/to/anamnesis/.venv/bin/python /path/to/anamnesis/tools/mcp_server.py --transport stdio
 ```
-Or via `uv` (zero virtualenv setup required):
+
+Remote (HTTP): run `python tools/mcp_server.py` (binds `127.0.0.1:7777/mcp`; put your own
+TLS proxy or tunnel in front), create a token per client, and send it as a header:
 ```bash
-claude mcp add anamnesis -e GEMINI_API_KEY=your_key -- uv run --with mcp --with google-genai /path/to/anamnesis/tools/mcp_server.py
+python tools/mcp_server.py add-client laptop            # prints the token once; stores only its SHA-256
+python tools/mcp_server.py add-client dashboard --read-only
+claude mcp add --transport http anamnesis https://memory.example.com/mcp \
+  --header "Authorization: Bearer $ANAMNESIS_TOKEN"
 ```
 
-### 2. Add to Cursor / Windsurf / Codex
-Add to your `mcp.json` or `.cursor/mcp.json`:
-```json
-{
-  "mcpServers": {
-    "anamnesis": {
-      "command": "python",
-      "args": ["/absolute/path/to/anamnesis/tools/mcp_server.py"],
-      "env": {
-        "GEMINI_API_KEY": "your_gemini_api_key",
-        "ANAMNESIS_OUT": "/path/to/anamnesis/memory.db"
-      }
-    }
-  }
-}
-```
+Tools: `brief`, `recall`, `recall_precedent`, `store_memory`, `store_decision`,
+`synthesize`, `trace`, `get_mistakes`, `get_topic`, `get_decisions`, `get_recent`,
+`session_context`, `list_files`, `read_file`, `get_capabilities`, `ontology_audit`,
+`ontology_impact`, `health`.
 
-Exposed MCP tools:
-- `recall_memory(query, limit, store_types)`: Semantic search with cosine reranking and offline keyword fallback.
-- `store_memory(type, title, content, rationale)`: Stores a markdown memory chunk and indexes it.
-- `store_decision(title, context, decision, alternatives, rationale)`: Appends an authoritative architectural decision.
-- `get_recent(limit, store_types)`: Chronological memory retrieval.
-- `get_decisions(limit, query)`: Filtered decision search.
-- `health()`: Verifies database size, chunk counts, and build commit.
+## Security model
+
+- **Header tokens only by default.** A token in a URL ends up in configs, proxy logs and
+  transcripts, so `?token=` is refused unless `ANAMNESIS_ALLOW_QUERY_TOKEN=1`.
+- **Per-client, hashed, scoped.** `clients.json` (mode 0600) stores SHA-256 hashes compared
+  with `hmac.compare_digest`; revoke one client without touching others, no restart needed.
+  Read-only clients cannot call `store_*`.
+- **OAuth for GUI connectors** (claude.ai, ChatGPT): `ANAMNESIS_OAUTH_PROVIDER=google|github`
+  with a mandatory server-side allowlist of emails/logins. Headless agents keep using
+  bearer tokens on the same endpoint.
+- **Fail closed.** Binds to loopback; unauthenticated loopback access is opt-in and
+  read-only; `read_file`/`list_files` are confined to configured roots (symlink-safe) and
+  refuse secrets, the DB and the clients file; tool output never contains host paths.
+- **Signed artifacts.** In the CI topology every release is Cosign-signed by a publish job
+  that runs no repository code; `pull-and-serve.sh` refuses any artifact not signed by this
+  repository's workflow on `main` (override only with `ANAMNESIS_ALLOW_UNSIGNED=1`).
+  Untrusted runs (PRs, forks, branches) build with mock embeddings and never see a secret.
+- **Secrets from the environment only** — never read from dotfiles or secret stores.
 
 ## License
 

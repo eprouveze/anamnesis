@@ -1,0 +1,153 @@
+{
+  "version": "1.0.0",
+  "updated_at": "2026-01-01",
+  "projects": [
+    {
+      "name": "example-app",
+      "aliases": ["example", "web-app"],
+      "description": "Fictional customer-facing web application",
+      "enabled": true
+    },
+    {
+      "name": "docs-site",
+      "aliases": ["docs"],
+      "description": "Fictional documentation site for example-app",
+      "enabled": true
+    },
+    {
+      "name": "legacy-importer",
+      "aliases": [],
+      "description": "Fictional retired data importer",
+      "enabled": false
+    }
+  ],
+  "store_types": {
+    "decision": {
+      "weight": 1.5,
+      "description": "Explicit architectural and product decisions",
+      "resolve_target": true,
+      "evidence_source": true
+    },
+    "feedback": {
+      "weight": 1.3,
+      "description": "Corrections and preferences from the human",
+      "resolve_target": true,
+      "evidence_source": true
+    },
+    "mistake": {
+      "weight": 1.3,
+      "description": "Failure patterns and anti-patterns",
+      "resolve_target": true,
+      "evidence_source": true
+    },
+    "solution": {
+      "weight": 1.2,
+      "description": "Reusable technical solutions",
+      "resolve_target": true,
+      "evidence_source": true
+    },
+    "project_meta": {
+      "weight": 1.5,
+      "description": "Per-project metadata records",
+      "resolve_target": true,
+      "evidence_source": true
+    },
+    "project_notes": {
+      "weight": 1.2,
+      "description": "Per-project stack, capabilities and known issues",
+      "resolve_target": true,
+      "evidence_source": true
+    },
+    "session_topic": {
+      "weight": 1.1,
+      "description": "Session summaries and themes"
+    },
+    "session_extracts": {
+      "weight": 1.15,
+      "description": "Extracted notes (decisions, failed approaches, corrections)"
+    },
+    "memory": {
+      "weight": 1.0,
+      "description": "General curated memory notes",
+      "evidence_source": true
+    },
+    "reference": { "weight": 1.0, "description": "Stable reference material" },
+    "capability": {
+      "weight": 1.0,
+      "description": "Capability registry entries"
+    },
+    "contact": { "weight": 1.0, "description": "People and organizations" },
+    "project_doc": {
+      "weight": 0.9,
+      "description": "Project documentation chunks"
+    },
+    "chat_export": {
+      "weight": 0.8,
+      "description": "Imported chat conversations"
+    },
+    "index": {
+      "weight": 0.7,
+      "description": "Index and table-of-contents files"
+    }
+  },
+  "ontology": {
+    "node_kinds": [
+      "Project",
+      "Service",
+      "Machine",
+      "Worker",
+      "Capability",
+      "Decision",
+      "Policy",
+      "Person",
+      "Incident",
+      "Topic"
+    ],
+    "predicates": [
+      "RUNS_ON",
+      "HOSTS_SERVICE",
+      "DEPENDS_ON",
+      "USES_CAPABILITY",
+      "PROVIDES_CAPABILITY",
+      "FALLBACK_TO",
+      "REPLICATES_TO",
+      "GOVERNS_SCOPE",
+      "DECIDED_FOR",
+      "SUPERSEDES",
+      "ENFORCED_BY",
+      "OBSERVED_IN",
+      "CONTACT_FOR_PROJECT"
+    ],
+    "polysemy_blocklist": ["run", "make", "work", "use", "set", "get", "fix", "update", "example", "unknown"],
+    "spof_kinds": ["Service", "Worker"],
+    "global_scopes": [],
+    "exclude_path_markers": []
+  },
+  "dev_root_candidates": ["src", "code", "projects"],
+  "path_roots": [],
+  "canonical_default_project": "",
+  "registries": {
+    "rules_files": ["CLAUDE.md", "AGENTS.md"],
+    "decision_logs": ["data/decisions/log.md"],
+    "capabilities": ["data/capabilities.json"],
+    "capability_edges": ["data/capability-edges.json"],
+    "contacts": ["data/contacts.json"],
+    "entities": ["data/entities.json"],
+    "enforcement": {
+      "dirs": ["tests", "scripts", "hooks", ".github/workflows"],
+      "extensions": [".py", ".sh", ".yml", ".yaml"],
+      "telemetry": ["data/rule-firings.jsonl"]
+    }
+  },
+  "policies": [
+    {
+      "id": "reviewed-before-merge",
+      "name": "Changes are reviewed before merge",
+      "scope": "project/example-app",
+      "source_path": "CONTRIBUTING.md",
+      "evidence_span": "CONTRIBUTING.md#review",
+      "description": "Every change to example-app lands through a reviewed pull request.",
+      "enforcement_patterns": ["required_reviews", "CODEOWNERS"]
+    }
+  ]
+}

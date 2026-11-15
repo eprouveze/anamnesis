@@ -1,19 +1,29 @@
 name: smoke
-# Prove GEMINI_API_KEY works in CI with one real embedding call (dim check).
+# Manual: prove GEMINI_API_KEY works with one real embedding call (dimension check).
+# Needs the repository secret, so it never runs on pull requests.
 on: { workflow_dispatch: {} }
+permissions:
+  contents: read
 jobs:
   smoke:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.12' }
-      - run: pip install --quiet google-genai
-      - env: { GEMINI_API_KEY: '${{ secrets.GEMINI_API_KEY }}' }
+      - run: pip install --quiet -r requirements.txt
+      - env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ANAMNESIS_EMBED_BACKEND: gemini
         run: |
           python - <<'PY'
-          import os
-          from google import genai
-          r = genai.Client(api_key=os.environ["GEMINI_API_KEY"]).models.embed_content(
-              model="gemini-embedding-001", contents=["anamnesis smoke"])
-          d = len(r.embeddings[0].values); print("dim", d); assert d == 3072; print("SMOKE PASS")
+          import sys; sys.path.insert(0, "tools")
+          import index
+          v = index.embed_batch(index.get_embed_client(), ["anamnesis smoke"], max_retries=2)[0]
+          print("model", index.EMBEDDING_MODEL, "dim", len(v))
+          assert len(v) == index.EMBEDDING_DIM, "unexpected embedding dimension"
+          print("SMOKE PASS")
           PY
